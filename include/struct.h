@@ -105,7 +105,6 @@ typedef struct ConfigItem_allow ConfigItem_allow;
 typedef struct ConfigFlag_allow ConfigFlag_allow;
 typedef struct ConfigItem_allow_channel ConfigItem_allow_channel;
 typedef struct ConfigItem_allow_dcc ConfigItem_allow_dcc;
-typedef struct ConfigItem_vhost ConfigItem_vhost;
 typedef struct ConfigItem_link	ConfigItem_link;
 typedef struct ConfigItem_ban ConfigItem_ban;
 typedef struct ConfigItem_deny_dcc ConfigItem_deny_dcc;
@@ -225,7 +224,8 @@ typedef enum LogFieldType {
 	LOG_FIELD_STRING,
 	LOG_FIELD_CLIENT,
 	LOG_FIELD_CHANNEL,
-	LOG_FIELD_OBJECT
+	LOG_FIELD_OBJECT,
+	LOG_FIELD_OBJECT_NOFREE
 } LogFieldType;
 
 typedef struct LogData {
@@ -435,6 +435,7 @@ typedef enum ClientStatus {
 #define CLIENT_FLAG_IPUSERS_BUMPED	0x100000000	/**< The IpUsersBucket for this IP has been bumped (and needs to be decreased on disconnect) */
 #define CLIENT_FLAG_DEADSOCKET_IS_BANNED	0x200000000	/**< The deadsocket message should also send ERR_YOUREBANNEDCREEP and such */
 #define CLIENT_FLAG_CONNECT_FLOOD_CHECKED	0x400000000	/**< connect-flood has been checked (there are two hooks, so need this) */
+#define CLIENT_FLAG_IPV6			0x800000000	/**< client is using IPv6 */
 /** @} */
 
 #define OPER_SNOMASKS "+bBcdfkqsSoO"
@@ -529,6 +530,7 @@ typedef enum ClientStatus {
 #define IsVirus(x)			((x)->flags & CLIENT_FLAG_VIRUS)
 #define IsIdentLookupSent(x)		((x)->flags & CLIENT_FLAG_IDENTLOOKUPSENT)
 #define IsAsyncRPC(x)			((x)->flags & CLIENT_FLAG_ASYNC_RPC)
+#define IsIPV6(x)			((x)->flags & CLIENT_FLAG_IPV6)
 #define SetIdentLookup(x)		do { (x)->flags |= CLIENT_FLAG_IDENTLOOKUP; } while(0)
 #define SetClosing(x)			do { (x)->flags |= CLIENT_FLAG_CLOSING; } while(0)
 #define SetDCCBlock(x)			do { (x)->flags |= CLIENT_FLAG_DCCBLOCK; } while(0)
@@ -561,6 +563,7 @@ typedef enum ClientStatus {
 #define SetVirus(x)			do { (x)->flags |= CLIENT_FLAG_VIRUS; } while(0)
 #define SetIdentLookupSent(x)		do { (x)->flags |= CLIENT_FLAG_IDENTLOOKUPSENT; } while(0)
 #define SetAsyncRPC(x)			do { (x)->flags |= CLIENT_FLAG_ASYNC_RPC; } while(0)
+#define SetIPV6(x)			do { (x)->flags |= CLIENT_FLAG_IPV6; } while(0)
 #define ClearIdentLookup(x)		do { (x)->flags &= ~CLIENT_FLAG_IDENTLOOKUP; } while(0)
 #define ClearClosing(x)			do { (x)->flags &= ~CLIENT_FLAG_CLOSING; } while(0)
 #define ClearDCCBlock(x)		do { (x)->flags &= ~CLIENT_FLAG_DCCBLOCK; } while(0)
@@ -592,11 +595,10 @@ typedef enum ClientStatus {
 #define ClearVirus(x)			do { (x)->flags &= ~CLIENT_FLAG_VIRUS; } while(0)
 #define ClearIdentLookupSent(x)		do { (x)->flags &= ~CLIENT_FLAG_IDENTLOOKUPSENT; } while(0)
 #define ClearAsyncRPC(x)		do { (x)->flags &= ~CLIENT_FLAG_ASYNC_RPC; } while(0)
+#define ClearIPV6(x)			do { (x)->flags &= ~CLIENT_FLAG_IPV6; } while(0)
 /** @} */
 
-#define IsIPV6(x)			((x)->local ? (((x)->local->socket_type == SOCKET_TYPE_IPV6) ? 1 : 0) : (strchr((x)->ip,':') ? 1 : 0))
 #define IsUnixSocket(x)			((x)->local->socket_type == SOCKET_TYPE_UNIX)
-#define SetIPV6(x)			do { (x)->local->socket_type = SOCKET_TYPE_IPV6; } while(0)
 #define SetUnixSocket(x)			do { (x)->local->socket_type = SOCKET_TYPE_UNIX; } while(0)
 
 /* Others that access client structs: */
@@ -1222,8 +1224,9 @@ struct BanAction {
 
 /** Server ban sub-struct of TKL entry (KLINE/GLINE/ZLINE/GZLINE/SHUN) */
 struct ServerBan {
-	char *usermask; /**< User mask */
-	char *hostmask; /**< Host mask */
+	char *usermask; /**< User mask (can be NULL if 'match' is non-NULL) */
+	char *hostmask; /**< Host mask (can be NULL if 'match' is non-NULL) */
+	SecurityGroup *match; /**< Match item (if set, usermask/hostmask is ignored) */
 	unsigned short subtype; /**< See TKL_SUBTYPE_* */
 	char *reason; /**< Reason */
 };
@@ -1465,7 +1468,8 @@ struct Client {
 	char id[IDLEN + 1];			/**< Unique ID: SID or UID */
 	struct list_head id_hash;		/**< For UID/SID hash table (idTable) */
 	Client *uplink;				/**< Server on where this client is connected to (can be &me) */
-	char *ip;				/**< IP address of user or server (never NULL) */
+	char *ip;				/**< IP address of user or server (can be NULL, eg for Services) */
+	char rawip[16];				/**< The raw IP in network byte order */
 	ModData moddata[MODDATA_MAX_CLIENT];	/**< Client attached module data, used by the ModData system */
 };
 
@@ -1553,7 +1557,6 @@ struct Server {
 
 /** @} */
 
-typedef struct RPCClient RPCClient;
 /** RPC Client information */
 struct RPCClient {
 	char *rpc_user; /**< Name of the rpc-user block after authentication, NULL during pre-auth */
@@ -1829,6 +1832,7 @@ struct TLSOptions {
 	int sts_port;
 	long sts_duration;
 	int sts_preload;
+	int certificate_expiry_notification;
 };
 
 struct ConfigItem_mask {
@@ -2011,15 +2015,6 @@ struct ConfigItem_sni {
 	TLSOptions *tls_options;
 };
 
-struct ConfigItem_vhost {
-	ConfigItem_vhost 	*prev, *next;
-	ConfigFlag 	flag;
-	SecurityGroup	*match;
-	char		*login, *virthost, *virtuser;
-	SWhois *swhois;
-	AuthConfig	*auth;
-};
-
 struct ConfigItem_link {
 	ConfigItem_link	*prev, *next;
 	ConfigFlag	flag;
@@ -2130,14 +2125,14 @@ struct ConfigResource {
 	char *url; /**< URL, if it is an URL */
 	char *cache_file; /**< Set to filename of local cached copy, if it is available */
 	NameList *restrict_config; /**< If non-NULL: list of permitted config items */
+	int warn_only_on_fail; /**< Set to 1 if we should ignore failed download attempts (and only warn) */
 };
 
 /* When doing a HTTP request and it is requested to store the
  * response to memory (rather than file), we enlarge the buffer
  * in this chunk size.
- * XXX: 128 bytes for testing chunks, should be 8k or so in production.
  */
-#define URL_MEMORY_BACKED_CHUNK_SIZE	128
+#define URL_MEMORY_BACKED_CHUNK_SIZE	8192
 
 struct ConfigItem_blacklist_module {
 	ConfigItem_blacklist_module *prev, *next;
@@ -2204,6 +2199,7 @@ struct SecurityGroup {
 	SecurityGroup *prev, *next;
 	int priority;
 	char name[SECURITYGROUPLEN+1];
+	int public;
 	NameValuePrioList *printable_list;
 	int printable_list_counter;
 	/* Include */
@@ -2218,6 +2214,7 @@ struct SecurityGroup {
 	NameList *security_group;
 	char *prettyrule; /* ::rule as a string */
 	CRuleNode *rule; /**< parsed crule */
+	NameList *destination;
 	NameValuePrioList *extended;
 	/* Exclude */
 	int exclude_identified;
@@ -2231,6 +2228,7 @@ struct SecurityGroup {
 	NameList *exclude_security_group;
 	char *exclude_prettyrule; /* ::exclude-rule as a string */
 	CRuleNode *exclude_rule; /**< parsed crule */
+	NameList *exclude_destination;
 	NameValuePrioList *exclude_extended;
 	/* Settings */
 	DynamicSetBlock settings;
@@ -2463,23 +2461,6 @@ extern MODVAR SSL_CTX *ctx_client;
 
 #define TLS_PROTOCOL_ALL		0xffff
 
-struct ThrottlingBucket
-{
-	struct ThrottlingBucket *prev, *next;
-	char *ip;
-	time_t since;
-	char count;
-};
-
-typedef struct IpUsersBucket IpUsersBucket;
-struct IpUsersBucket
-{
-	IpUsersBucket *prev, *next;
-	char rawip[16];
-	int local_clients;
-	int global_clients;
-};
-
 typedef struct CoreChannelModeTable CoreChannelModeTable;
 struct CoreChannelModeTable {
 	long mode;			/**< Mode value (which bit will be set) */
@@ -2520,11 +2501,6 @@ struct PendingNet {
 	Client *client; /**< Client to which these servers belong */
 	PendingServer *servers; /**< The list of servers connected to the client */
 };
-
-extern void init_throttling();
-extern struct ThrottlingBucket *find_throttling_bucket(Client *);
-extern void add_throttling_bucket(Client *);
-extern int throttle_can_connect(Client *);
 
 typedef struct MaxTarget MaxTarget;
 struct MaxTarget {
@@ -2613,6 +2589,8 @@ typedef struct GeoIPResult GeoIPResult;
 struct GeoIPResult {
 	char *country_code;
 	char *country_name;
+	unsigned int asn;
+	char *asname;
 };
 
 typedef enum WhoisConfigDetails {

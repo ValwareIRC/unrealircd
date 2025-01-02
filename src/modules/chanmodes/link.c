@@ -361,6 +361,7 @@ int link_pre_localjoin_cb(Client *client, Channel *channel, const char *key)
 		b->client = client;
 		b->channel = channel;
 		b->ban_check_types = BANCHK_JOIN;
+		b->ban_type = EXBTYPE_BAN;
 
 		for (ban = channel->banlist; ban; ban = ban->next)
 		{
@@ -421,8 +422,31 @@ int link_pre_localjoin_cb(Client *client, Channel *channel, const char *key)
 			b->banstr = banmask;
 			if (ban_check_mask(b))
 			{
-				safe_free(b);
-				return link_doforward(client, channel, banchan, LINKTYPE_BAN);
+				/* Forward ban matched, now check for +e */
+				Ban *ex = NULL;
+				b->ban_type = EXBTYPE_EXCEPT;
+				for (ex = channel->exlist; ex; ex = ex->next)
+				{
+					b->banstr = ex->banstr;
+					if (ban_check_mask(b))
+					{
+						/* except matched, break inner loop */
+						break;
+					}
+				}
+				if (ex == NULL)
+				{
+					/* A ~forward ban matched, go for it.. */
+					safe_free(b);
+					return link_doforward(client, channel, banchan, LINKTYPE_BAN);
+				} else {
+					/* Break the outer loop as well: the user is exempt,
+					 * so it makes no sense to check other bans anymore.
+					 * no "safe_free(b);" here because that is taken
+					 * care of further down.
+					 */
+					break;
+				}
 			}
 		}
 
@@ -446,7 +470,7 @@ int link_pre_localjoin_cb(Client *client, Channel *channel, const char *key)
 		return link_doforward(client, channel, linked, LINKTYPE_SECURE);
 
 	// Registered/identified users only
-	if (has_channel_mode(channel, 'R') && !IsRegNick(client))
+	if (has_channel_mode(channel, 'R') && !IsLoggedIn(client))
 		return link_doforward(client, channel, linked, LINKTYPE_REG);
 
 	// For a couple of conditions we can use the return value from can_join() =]

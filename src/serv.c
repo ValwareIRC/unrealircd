@@ -537,26 +537,46 @@ CMD_FUNC(cmd_rehash)
 		return;
 	}
 
+	if (!MyUser(client) && (parc < 2))
+	{
+		sendnumeric(client, ERR_NEEDMOREPARAMS, "REHASH");
+		return;
+	}
+
 	if ((parc < 3) || BadPtr(parv[2])) {
 		/* If the argument starts with a '-' (like -motd, -opermotd, etc) then it's
 		 * assumed not to be a server. -- Syzop
 		 */
 		if (parv[1] && (parv[1][0] == '-'))
+		{
 			x = HUNTED_ISME;
-		else
+		} else {
+			if (!ValidatePermissionsForPath("server:rehash:global",client,NULL,NULL,NULL) &&
+			    parv[1] && (find_client(parv[1], NULL) != &me))
+			{
+				sendnumeric(client, ERR_NOPRIVILEGES);
+				return;
+			}
 			x = hunt_server(client, recv_mtags, "REHASH", 1, parc, parv);
+		}
 	} else {
 		if (match_simple("-glob*", parv[1])) /* This is really ugly... hack to make /rehash -global -something work */
 		{
 			x = HUNTED_ISME;
 		} else {
+			if (!ValidatePermissionsForPath("server:rehash:global",client,NULL,NULL,NULL) &&
+			    parv[1] && (find_client(parv[1], NULL) != &me))
+			{
+				sendnumeric(client, ERR_NOPRIVILEGES);
+				return;
+			}
 			x = hunt_server(client, NULL, "REHASH", 1, parc, parv);
 		}
 	}
 	if (x != HUNTED_ISME)
 		return; /* Now forwarded or server didnt exist */
 
-	if (!MyConnect(client))
+	if (!MyUser(client))
 	{
 #ifndef REMOTE_REHASH
 		sendnumeric(client, ERR_NOPRIVILEGES);
@@ -577,10 +597,27 @@ CMD_FUNC(cmd_rehash)
 		/* Ok this is in an 'else' because it should be only executed for local clients,
 		 * but it's totally unrelated to the above ;).
 		 */
-		if (parv[1] && match_simple("-glob*", parv[1]))
+		if (parv[1] && !strcasecmp(parv[1], "-all"))
+		{
+			sendnumeric(client, ERR_CANNOTDOCOMMAND, "REHASH",
+			            "The command 'REHASH -all' does not exist. "
+			            "Did you mean just 'REHASH'? "
+			            "Or did you mean 'REHASH -global' which rehashes all IRC servers on the network?");
+			/* In a future version we may make 'REHASH -all' to mean 'REHASH -global', but not yet.. */
+			return;
+		}
+		if (parv[1] &&
+		    (match_simple("-glob*", parv[1])
+		     /* || (MyUser(client) && !strcasecmp(parv[1], "-all"))*/ ))
 		{
 			/* /REHASH -global [options] */
 			Client *acptr;
+
+			if (!ValidatePermissionsForPath("server:rehash:global",client,NULL,NULL,NULL))
+			{
+				sendnumeric(client, ERR_NOPRIVILEGES);
+				return;
+			}
 			
 			/* Shift parv's to the left */
 			parv[1] = parv[2];
@@ -599,7 +636,7 @@ CMD_FUNC(cmd_rehash)
 				sendto_one(acptr, NULL, ":%s REHASH %s %s",
 					client->name,
 					acptr->name,
-					parv[1] ? parv[1] : "-all");
+					parv[1] ? parv[1] : "");
 			}
 			/* Don't return, continue, because we need to REHASH ourselves as well. */
 		}

@@ -582,9 +582,11 @@ struct HistoryFilter {
 typedef struct HistoryLogLine HistoryLogLine;
 struct HistoryLogLine {
 	HistoryLogLine *prev, *next;
-	time_t t;
-	MessageTag *mtags;
-	char line[1];
+	time_t t;		/**< Rounded time on seconds, for quick access. */
+	char *msgid;		/**< Pointer to 'msgid' mtag. Do NOT free this, it is freed by freeing 'mtags'. */
+	char *time;		/**< Pointer to 'time' mtag. Do NOT free this, it is freed by freeing 'mtags'. */
+	MessageTag *mtags;	/**< Message tags associated with this message */
+	char line[1];		/**< The full (old-skool) IRC protocol line */
 };
 
 typedef struct HistoryResult HistoryResult;
@@ -1304,6 +1306,10 @@ extern APICallback *APICallbackAdd(Module *module, APICallback *mreq);
 #define HOOKTYPE_WATCH_DEL	122
 /** See hooktype_monitor_notification */
 #define HOOKTYPE_MONITOR_NOTIFICATION	123
+/** See hooktype_sasl_authenticate */
+#define HOOKTYPE_SASL_AUTHENTICATE	124
+/** See hooktype_sasl_mechs */
+#define HOOKTYPE_SASL_MECHS		125
 
 /* Adding a new hook here?
  * 1) Add the #define HOOKTYPE_.... with a new number
@@ -2304,7 +2310,9 @@ int hooktype_realname_change(Client *client, const char *oldinfo);
 /** Called when changing IP (eg due to PROXY/WEBIRC/etc).
  * @param client		The client whose IP has changed
  * @param oldip			Old IP of the client
- * @return The return value is ignored (use return 0)
+ * @returns If you reject the user then use dead_link() and return HOOK_DENY
+ *          (DO NOT USE exit_client(), only dead_link()!),
+ *          otherwise use 'return 0' to proceed normally.
  */
 int hooktype_ip_change(Client *client, const char *oldip);
 
@@ -2404,6 +2412,20 @@ int hooktype_watch_del(char *nick, Client *client, int flags);
  */
 int hooktype_monitor_notification(Client *watcher, Client *client, int online);
 
+/** Called when an AUTHENTICATE command is sent by the client, for SASL authentication.
+ * This can be used by authentication modules.
+ * @param client		The client (user)
+ * @param first			Set to 1 if this is the first AUTHENTICATE, set to 0 if it is a continuation.
+ * @param param			The AUTHENTICATE parameter (max 400 chars)
+ * @return The return value is ignored (use return 0)
+ */
+int hooktype_sasl_authenticate(Client *client, int first, const char *param);
+
+/** Called for showing SASL mechanisms eg in sasl=xxx via "CAP LS 302"
+ * @param client		The client
+ * @return The saslmechlist
+ */
+const char *hooktype_sasl_mechs(Client *client);
 /** @} */
 
 #ifdef GCC_TYPECHECKING
@@ -2529,7 +2551,9 @@ _UNREAL_ERROR(_hook_error_incompatible, "Incompatible hook function. Check argum
         ((hooktype == HOOKTYPE_CONFIG_LISTENER) && !ValidateHook(hooktype_config_listener, func)) || \
         ((hooktype == HOOKTYPE_WATCH_ADD) && !ValidateHook(hooktype_watch_add, func)) || \
         ((hooktype == HOOKTYPE_WATCH_DEL) && !ValidateHook(hooktype_watch_del, func)) || \
-        ((hooktype == HOOKTYPE_MONITOR_NOTIFICATION) && !ValidateHook(hooktype_monitor_notification, func))) \
+        ((hooktype == HOOKTYPE_MONITOR_NOTIFICATION) && !ValidateHook(hooktype_monitor_notification, func)) || \
+        ((hooktype == HOOKTYPE_SASL_AUTHENTICATE) && !ValidateHook(hooktype_sasl_authenticate, func)) || \
+        ((hooktype == HOOKTYPE_SASL_MECHS) && !ValidateHook(hooktype_sasl_mechs, func))) \
         _hook_error_incompatible();
 #endif /* GCC_TYPECHECKING */
 
@@ -2687,6 +2711,14 @@ enum EfunctionType {
 	EFUNC_GET_CENTRAL_API_KEY,
 	EFUNC_CENTRAL_SPAMREPORT,
 	EFUNC_CENTRAL_SPAMREPORT_ENABLED,
+	EFUNC_SASL_SUCCEEDED,
+	EFUNC_SASL_FAILED,
+	EFUNC_DECODE_AUTHENTICATE_PLAIN,
+	EFUNC_EXIT_CLIENT,
+	EFUNC_EXIT_CLIENT_FMT,
+	EFUNC_EXIT_CLIENT_EX,
+	EFUNC_BANNED_CLIENT,
+	EFUNC_UNREAL_EXPAND_STRING,
 };
 
 /* Module flags */

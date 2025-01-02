@@ -45,8 +45,23 @@ ModuleHeader MOD_HEADER
  */
 #define ASSUME_NICK_IN_FLIGHT
 
+#define IPUSERS_HASH_TABLE_SIZE 8192
+
+/* Structs */
+typedef struct IpUsersBucket IpUsersBucket;
+struct IpUsersBucket
+{
+	IpUsersBucket *prev, *next;
+	char rawip[16];
+	int local_clients;
+	int global_clients;
+};
+
 /* Variables */
 static char spamfilter_user[NICKLEN + USERLEN + HOSTLEN + REALLEN + 64];
+IpUsersBucket **IpUsersHash_ipv4 = NULL;
+IpUsersBucket **IpUsersHash_ipv6 = NULL;
+char *siphashkey_ipusers = NULL;
 
 /* Forward declarations */
 CMD_FUNC(cmd_nick);
@@ -57,19 +72,45 @@ int _register_user(Client *client);
 void nick_collision(Client *cptr, const char *newnick, const char *newid, Client *new, Client *existing, int type);
 int AllowClient(Client *client);
 int exceeds_maxperip(Client *client, ConfigItem_allow *aconf);
+void siphashkey_ipusers_free(ModData *m);
+void ipusershash_free_4(ModData *m);
+void ipusershash_free_6(ModData *m);
+IpUsersBucket *add_ipusers_bucket(Client *client);
+void decrease_ipusers_bucket(Client *client);
+int decrease_ipusers_bucket_wrapper(Client *client);
+int stats_maxperip(Client *client, const char *para);
+char *_unreal_expand_string(const char *str, char *buf, size_t buflen, NameValuePrioList *nvp, int buildvarstring_options, Client *client);
 
 MOD_TEST()
 {
 	MARK_AS_OFFICIAL_MODULE(modinfo);
 	EfunctionAdd(modinfo->handle, EFUNC_REGISTER_USER, _register_user);
+	EfunctionAddString(modinfo->handle, EFUNC_UNREAL_EXPAND_STRING, _unreal_expand_string);
 	return MOD_SUCCESS;
 }
 
 MOD_INIT()
 {
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
+	LoadPersistentPointer(modinfo, siphashkey_ipusers, siphashkey_ipusers_free);
+	if (!siphashkey_ipusers)
+	{
+		siphashkey_ipusers = safe_alloc(SIPHASH_KEY_LENGTH);
+		siphash_generate_key(siphashkey_ipusers);
+	}
+	LoadPersistentPointer(modinfo, IpUsersHash_ipv4, ipusershash_free_4);
+	if (!IpUsersHash_ipv4)
+		IpUsersHash_ipv4 = safe_alloc(sizeof(IpUsersBucket *) * IPUSERS_HASH_TABLE_SIZE);
+	LoadPersistentPointer(modinfo, IpUsersHash_ipv6, ipusershash_free_6);
+	if (!IpUsersHash_ipv6)
+		IpUsersHash_ipv6 = safe_alloc(sizeof(IpUsersBucket *) * IPUSERS_HASH_TABLE_SIZE);
+
 	CommandAdd(modinfo->handle, "NICK", cmd_nick, MAXPARA, CMD_USER|CMD_SERVER|CMD_UNREGISTERED);
 	CommandAdd(modinfo->handle, "UID", cmd_uid, MAXPARA, CMD_SERVER);
-	MARK_AS_OFFICIAL_MODULE(modinfo);
+
+	HookAdd(modinfo->handle, HOOKTYPE_FREE_USER, 0, decrease_ipusers_bucket_wrapper);
+	HookAdd(modinfo->handle, HOOKTYPE_STATS, 0, stats_maxperip);
 	return MOD_SUCCESS;
 }
 
@@ -80,7 +121,177 @@ MOD_LOAD()
 
 MOD_UNLOAD()
 {
+	SavePersistentPointer(modinfo, siphashkey_ipusers);
+	SavePersistentPointer(modinfo, IpUsersHash_ipv4);
+	SavePersistentPointer(modinfo, IpUsersHash_ipv6);
 	return MOD_SUCCESS;
+}
+
+void siphashkey_ipusers_free(ModData *m)
+{
+	safe_free(siphashkey_ipusers);
+	m->ptr = NULL;
+}
+
+void ipusershash_free_4(ModData *m)
+{
+	// FIXME: need to free every bucket in a for loop
+	// and then end with this:
+	safe_free(IpUsersHash_ipv4);
+	m->ptr = NULL;
+}
+
+void ipusershash_free_6(ModData *m)
+{
+	// FIXME: need to free every bucket in a for loop
+	// and then end with this:
+	safe_free(IpUsersHash_ipv6);
+	m->ptr = NULL;
+}
+
+uint64_t hash_ipusers(Client *client)
+{
+	if (IsIPV6(client))
+		return siphash_raw(client->rawip, 16, siphashkey_ipusers) % IPUSERS_HASH_TABLE_SIZE;
+	else
+		return siphash_raw(client->rawip, 4, siphashkey_ipusers) % IPUSERS_HASH_TABLE_SIZE;
+}
+
+IpUsersBucket *find_ipusers_bucket(Client *client)
+{
+	int hash = 0;
+	IpUsersBucket *p;
+
+	hash = hash_ipusers(client);
+
+	if (IsIPV6(client))
+	{
+		for (p = IpUsersHash_ipv6[hash]; p; p = p->next)
+			if (memcmp(p->rawip, client->rawip, 16) == 0)
+				return p;
+	} else {
+		for (p = IpUsersHash_ipv4[hash]; p; p = p->next)
+			if (memcmp(p->rawip, client->rawip, 4) == 0)
+				return p;
+	}
+
+	return NULL;
+}
+
+/* (wrapper needed because hook has return type 'int' and function is 'void' */
+int decrease_ipusers_bucket_wrapper(Client *client)
+{
+	decrease_ipusers_bucket(client);
+	return 0;
+}
+
+IpUsersBucket *add_ipusers_bucket(Client *client)
+{
+	int hash;
+	IpUsersBucket *n;
+
+	hash = hash_ipusers(client);
+
+	n = safe_alloc(sizeof(IpUsersBucket));
+	if (IsIPV6(client))
+	{
+		memcpy(n->rawip, client->rawip, 16);
+		AddListItem(n, IpUsersHash_ipv6[hash]);
+	} else {
+		memcpy(n->rawip, client->rawip, 4);
+		AddListItem(n, IpUsersHash_ipv4[hash]);
+	}
+	return n;
+}
+
+void decrease_ipusers_bucket(Client *client)
+{
+	int hash = 0;
+	IpUsersBucket *p;
+
+	if (!(client->flags & CLIENT_FLAG_IPUSERS_BUMPED))
+		return; /* nothing to do */
+
+	client->flags &= ~CLIENT_FLAG_IPUSERS_BUMPED;
+
+	hash = hash_ipusers(client);
+
+	if (IsIPV6(client))
+	{
+		for (p = IpUsersHash_ipv6[hash]; p; p = p->next)
+			if (memcmp(p->rawip, client->rawip, 16) == 0)
+				break;
+	} else {
+		for (p = IpUsersHash_ipv4[hash]; p; p = p->next)
+			if (memcmp(p->rawip, client->rawip, 4) == 0)
+				break;
+	}
+
+	if (!p)
+	{
+		unreal_log(ULOG_INFO, "user", "BUG_DECREASE_IPUSERS_BUCKET", client,
+		           "[BUG] decrease_ipusers_bucket() called but bucket is gone for client $client.details");
+		return;
+	}
+
+	p->global_clients--;
+	if (MyConnect(client))
+		p->local_clients--;
+
+	if ((p->global_clients == 0) && (p->local_clients == 0))
+	{
+		if (IsIPV6(client))
+			DelListItem(p, IpUsersHash_ipv6[hash]);
+		else
+			DelListItem(p, IpUsersHash_ipv4[hash]);
+		safe_free(p);
+	}
+}
+
+int stats_maxperip(Client *client, const char *para)
+{
+	int i;
+	IpUsersBucket *e;
+	char ipbuf[256];
+	const char *ip;
+
+	/* '/STATS 8' or '/STATS maxperip' is for us... */
+	if (strcmp(para, "8") && strcasecmp(para, "maxperip"))
+		return 0;
+
+	if (!ValidatePermissionsForPath("server:info:stats",client,NULL,NULL,NULL))
+	{
+		sendnumeric(client, ERR_NOPRIVILEGES);
+		return 0;
+	}
+
+	sendtxtnumeric(client, "MaxPerIp IPv4 hash table:");
+	for (i=0; i < IPUSERS_HASH_TABLE_SIZE; i++)
+	{
+		for (e = IpUsersHash_ipv4[i]; e; e = e->next)
+		{
+			ip = inetntop(AF_INET, e->rawip, ipbuf, sizeof(ipbuf));
+			if (!ip)
+				ip = "<invalid>";
+			sendtxtnumeric(client, "IPv4 #%d %s: %d local / %d global",
+				       i, ip, e->local_clients, e->global_clients);
+		}
+	}
+
+	sendtxtnumeric(client, "MaxPerIp IPv6 hash table:");
+	for (i=0; i < IPUSERS_HASH_TABLE_SIZE; i++)
+	{
+		for (e = IpUsersHash_ipv6[i]; e; e = e->next)
+		{
+			ip = inetntop(AF_INET6, e->rawip, ipbuf, sizeof(ipbuf));
+			if (!ip)
+				ip = "<invalid>";
+			sendtxtnumeric(client, "IPv6 #%d %s: %d local / %d global",
+				       i, ip, e->local_clients, e->global_clients);
+		}
+	}
+
+	return 0;
 }
 
 /** Hmm.. don't we already have such a function? */
@@ -654,7 +865,7 @@ nickkill2done:
 
 	serv = client;
 	client = make_client(serv->direction, serv);
-	strlcpy(client->id, parv[6], IDLEN);
+	strlcpy(client->id, parv[6], sizeof(client->id));
 	add_client_to_list(client);
 	add_to_id_hash_table(client->id, client);
 	client->lastnick = atol(parv[3]);
@@ -668,7 +879,22 @@ nickkill2done:
 	client->user->server = find_or_add(client->uplink->name);
 	strlcpy(client->user->realhost, hostname, sizeof(client->user->realhost));
 	if (ip)
-		safe_strdup(client->ip, ip);
+	{
+		if (!set_client_ip(client, ip))
+		{
+			/* This should not be possible as we validate the 'ip' with
+			 * the call to decode_ip() about 100 lines up.
+			 */
+			unreal_log(ULOG_ERROR, "nick", "REMOTE_CLIENT_IP_BUG", client,
+				   "[BUG] client $client has invalid ip $ip -- rejected",
+				   log_data_string("ip", ip));
+#ifdef DEBUGMODE
+			abort();
+#endif
+			/* This could leave a ghost / unsynched, but it should never happen... right? */
+			return;
+		}
+	}
 
 	if (*sstamp != '*')
 		strlcpy(client->user->account, sstamp, sizeof(client->user->account));
@@ -1088,7 +1314,12 @@ int _register_user(Client *client)
 			break;
 	}
 
+	/* User is going to be accepted -- don't reject the user anymore under this line! */
+
 	SetUser(client);
+
+	/* set::modes-on-connect - needs to be here for account-based custom set settings (PR #270) */
+	client->umodes |= get_setting_for_user_number(client, SET_MODES_ON_CONNECT);
 
 	make_cloakedhost(client, client->user->realhost, client->user->cloakedhost, sizeof(client->user->cloakedhost));
 
@@ -1346,4 +1577,73 @@ int AllowClient(Client *client)
 	/* User did not match any allow { } blocks: */
 	exit_client(client, NULL, iConf.reject_message_unauthorized);
 	return 0;
+}
+
+/** Expand 'str' which contains '$variables' into 'buf'.
+ * @param str		The string which may contain $variables
+ * @param buf		The buffer to store the result in
+ * @param buflen	The size of 'buf'
+ * @param nvp		A list with custom extra variables, or simply NULL.
+ *			Note that the list is freed at the end, including the custom settings.
+ * @param buildvarstring_options	One or more of BUILDVARSTRING_* or simply 0.
+ * @param client	The client to expand details from
+ * @returns A pointer to 'buf'
+ * @notes If you do provide a non-NULL 'nvp' then note that the entire nvp list is FREED before return
+ *        including your custom list!
+ */
+char *_unreal_expand_string(const char *str, char *buf, size_t buflen, NameValuePrioList *nvp, int buildvarstring_options, Client *client)
+{
+	const char *s;
+
+	if (client)
+	{
+		add_nvplist(&nvp, 0, "nick", client->name);
+		add_nvplist(&nvp, 0, "servername", client->uplink->name);
+		add_nvplist(&nvp, 0, "server", client->uplink->name); /* (old backwards compatible name) */
+		add_nvplist(&nvp, 0, "ip", GetIP(client));
+
+		if (client->user && *client->user->realhost)
+			add_nvplist(&nvp, 0, "hostname", client->user->realhost);
+		else if (client->local && *client->local->sockhost)
+			add_nvplist(&nvp, 0, "hostname", client->local->sockhost);
+		else
+			add_nvplist(&nvp, 0, "hostname", GetIP(client));
+
+		if (client->user)
+		{
+			add_nvplist(&nvp, 0, "username", client->user->username);
+			add_nvplist(&nvp, 0, "realname", client->info);
+			add_nvplist(&nvp, 0, "account", client->user->account);
+			s = get_operlogin(client);
+			if (s)
+				add_nvplist(&nvp, 0, "operlogin", s);
+			s = get_operclass(client);
+			if (s)
+				add_nvplist(&nvp, 0, "operclass", s);
+		}
+		if (client->ip)
+		{
+			GeoIPResult *geo = geoip_client(client);
+			if (geo)
+			{
+				char asn[32];
+				if (geo->country_code)
+					add_nvplist(&nvp, 0, "country_code", geo->country_code);
+				else
+					add_nvplist(&nvp, 0, "country_code", "XX");
+
+				/* Safe to set this unconditionally, will simply be 0
+				 * for things like localhost and such.
+				 */
+				snprintf(asn, sizeof(asn), "%d", geo->asn);
+				add_nvplist(&nvp, 0, "asn", asn);
+			} else {
+				add_nvplist(&nvp, 0, "country_code", "XX");
+				add_nvplist(&nvp, 0, "asn", "0");
+			}
+		}
+	}
+	buildvarstring_nvp(str, buf, buflen, nvp, buildvarstring_options);
+	safe_free_nvplist(nvp);
+	return buf;
 }

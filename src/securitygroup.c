@@ -243,10 +243,13 @@ int test_match_item(ConfigFile *conf, ConfigEntry *cep, int *errors)
 			}
 		}
 	} else
-	if (!strcmp(cep->name, "ip"))
+	if (!strcmp(cep->name, "ip") || !strcmp(cep->name, "exclude-ip"))
 	{
 	} else
 	if (!strcmp(cep->name, "security-group") || !strcmp(cep->name, "exclude-security-group"))
+	{
+	} else
+	if (!strcmp(cep->name, "destination") || !strcmp(cep->name, "exclude-destination"))
 	{
 	} else
 	if (!strcmp(cep->name, "rule") || !strcmp(cep->name, "exclude-rule"))
@@ -365,6 +368,14 @@ int _test_security_group(ConfigFile *conf, ConfigEntry *ce)
 
 	for (cep = ce->items; cep; cep = cep->next)
 	{
+		if (!strcmp(cep->name, "public"))
+		{
+			CheckNull(cep);
+		} else
+		if (!strcmp(cep->name, "priority"))
+		{
+			CheckNull(cep);
+		} else
 		if (!test_match_item(conf, cep, &errors))
 		{
 			config_error_unknown(cep->file->filename, cep->line_number,
@@ -435,6 +446,10 @@ int conf_match_item(ConfigFile *conf, ConfigEntry *cep, SecurityGroup **block)
 		safe_strdup(s->prettyrule, cep->value);
 		s->rule = crule_parse(s->prettyrule);
 	}
+	else if (!strcmp(cep->name, "destination"))
+	{
+		unreal_add_names(&s->destination, cep);
+	}
 	else if (!strcmp(cep->name, "exclude-webirc"))
 		s->exclude_webirc = config_checkval(cep->value, CFG_YESNO);
 	else if (!strcmp(cep->name, "exclude-websocket"))
@@ -454,6 +469,10 @@ int conf_match_item(ConfigFile *conf, ConfigEntry *cep, SecurityGroup **block)
 	{
 		unreal_add_masks(&s->exclude_mask, cep);
 	}
+	else if (!strcmp(cep->name, "exclude-ip"))
+	{
+		unreal_add_names(&s->exclude_ip, cep);
+	}
 	else if (!strcmp(cep->name, "exclude-security-group"))
 	{
 		unreal_add_names(&s->exclude_security_group, cep);
@@ -462,6 +481,10 @@ int conf_match_item(ConfigFile *conf, ConfigEntry *cep, SecurityGroup **block)
 	{
 		safe_strdup(s->exclude_prettyrule, cep->value);
 		s->exclude_rule = crule_parse(s->exclude_prettyrule);
+	}
+	else if (!strcmp(cep->name, "exclude-destination"))
+	{
+		unreal_add_names(&s->exclude_destination, cep);
 	}
 	else
 	{
@@ -540,7 +563,12 @@ int _conf_security_group(ConfigFile *conf, ConfigEntry *ce)
 			DelListItem(s, securitygroups);
 			AddListItemPrio(s, securitygroups, s->priority);
 		} else
+		if (!strcmp(cep->name, "public"))
+		{
+			s->public = config_checkval(cep->value, CFG_YESNO);
+		} else {
 			conf_match_item(conf, cep, &s);
+		}
 	}
 	return 1;
 }
@@ -621,6 +649,8 @@ void free_security_group(SecurityGroup *s)
 	unreal_delete_masks(s->exclude_mask);
 	free_entire_name_list(s->security_group);
 	free_entire_name_list(s->exclude_security_group);
+	free_entire_name_list(s->destination);
+	free_entire_name_list(s->exclude_destination);
 	safe_crule_free(s->rule);
 	safe_crule_free(s->exclude_rule);
 	safe_free(s->prettyrule);
@@ -647,6 +677,8 @@ SecurityGroup *duplicate_security_group(SecurityGroup *s)
 	n->exclude_mask = unreal_duplicate_masks(s->exclude_mask);
 	n->security_group = duplicate_name_list(s->security_group);
 	n->exclude_security_group = duplicate_name_list(s->exclude_security_group);
+	n->destination = duplicate_name_list(s->destination);
+	n->exclude_destination = duplicate_name_list(s->exclude_destination);
 	if (s->prettyrule)
 	{
 		safe_strdup(n->prettyrule, s->prettyrule);
@@ -657,7 +689,8 @@ SecurityGroup *duplicate_security_group(SecurityGroup *s)
 		safe_strdup(n->exclude_prettyrule, s->exclude_prettyrule);
 		n->exclude_rule = crule_parse(n->exclude_prettyrule);
 	}
-	n->ip = duplicate_name_list(s->exclude_ip);
+	n->ip = duplicate_name_list(s->ip);
+	n->exclude_ip = duplicate_name_list(s->exclude_ip);
 	n->extended = duplicate_nvplist(s->extended);
 	n->exclude_extended = duplicate_nvplist(s->exclude_extended);
 	n->printable_list = duplicate_nvplist(s->printable_list);
@@ -680,28 +713,50 @@ void set_security_group_defaults(void)
 
 	/* Default group: webirc */
 	s = add_security_group("webirc-users", 50);
+	s->public = 1;
 	s->webirc = 1;
 
 	/* Default group: websocket */
 	s = add_security_group("websocket-users", 51);
+	s->public = 1;
 	s->websocket = 1;
 
 	/* Default group: known-users */
 	s = add_security_group("known-users", 100);
+	s->public = 1;
 	s->identified = 1;
 	s->reputation_score = 25;
 	s->webirc = 0;
-
-	/* Default group: tls-and-known-users */
-	s = add_security_group("tls-and-known-users", 200);
-	s->identified = 1;
-	s->reputation_score = 25;
-	s->webirc = 0;
-	s->tls = 1;
 
 	/* Default group: tls-users */
 	s = add_security_group("tls-users", 300);
+	s->public = 1;
 	s->tls = 1;
+}
+
+/* Next function looks similar to _match_user_extended_server_ban in tkl.c,
+ * but the one in tkl.c works on a single string, has an extra 'is extended ban?'
+ * check and splits it into name/value etc.
+ */
+
+int user_matches_extended_server_ban(Client *client, const char *name, const char *value)
+{
+	Extban *extban;
+	BanContext b;
+
+	extban = findmod_by_bantype_raw(name, strlen(name));
+	if (!extban ||
+	    !(extban->options & EXTBOPT_TKL) ||
+	    !(extban->is_banned_events & BANCHK_TKL))
+	{
+		return 0; /* extban not found or of incorrect type */
+	}
+
+	memset(&b, 0, sizeof(BanContext));
+	b.client = client;
+	b.banstr = value;
+	b.ban_check_types = BANCHK_TKL;
+	return extban->is_banned(&b);
 }
 
 int user_matches_extended_list(Client *client, NameValuePrioList *e)
@@ -710,22 +765,8 @@ int user_matches_extended_list(Client *client, NameValuePrioList *e)
 	BanContext b;
 
 	for (; e; e = e->next)
-	{
-		extban = findmod_by_bantype_raw(e->name, strlen(e->name));
-		if (!extban ||
-		    !(extban->options & EXTBOPT_TKL) ||
-		    !(extban->is_banned_events & BANCHK_TKL))
-		{
-			continue; /* extban not found or of incorrect type */
-		}
-
-		memset(&b, 0, sizeof(BanContext));
-		b.client = client;
-		b.banstr = e->value;
-		b.ban_check_types = BANCHK_TKL;
-		if (extban->is_banned(&b))
+		if (user_matches_extended_server_ban(client, e->name, e->value))
 			return 1;
-	}
 
 	return 0;
 }
@@ -782,23 +823,12 @@ int user_allowed_by_security_group_list(Client *client, NameList *l)
 	return 0;
 }
 
-/** Helper for security-group::rule and mask::rule */
-int user_allowed_by_rule(Client *client, CRuleNode *rule)
-{
-	crule_context context;
-
-	memset(&context, 0, sizeof(context));
-	context.client = client;
-
-	return crule_eval(&context, rule);
-}
-
 /** Returns 1 if the user is OK as far as the security-group is concerned.
  * @param client	The client to check
  * @param s		The security-group to check against
  * @retval 1 if user is allowed by security-group, 0 if not.
  */
-int user_allowed_by_security_group(Client *client, SecurityGroup *s)
+int user_allowed_by_security_group_context(Client *client, SecurityGroup *s, crule_context *context)
 {
 	static int recursion_security_group = 0;
 
@@ -846,11 +876,13 @@ int user_allowed_by_security_group(Client *client, SecurityGroup *s)
 		goto user_not_allowed;
 	if (s->exclude_ip && unreal_match_iplist(client, s->exclude_ip))
 		goto user_not_allowed;
-	if (s->exclude_rule && user_allowed_by_rule(client, s->exclude_rule))
+	if (s->exclude_rule && crule_eval(context, s->exclude_rule))
 		goto user_not_allowed;
 	if (s->exclude_extended && user_matches_extended_list(client, s->exclude_extended))
 		goto user_not_allowed;
 	if (s->exclude_security_group && user_allowed_by_security_group_list(client, s->exclude_security_group))
+		goto user_not_allowed;
+	if (s->exclude_destination && context->destination && find_name_list_match(s->exclude_destination, context->destination))
 		goto user_not_allowed;
 
 	/* Then process INCLUSION criteria... */
@@ -872,17 +904,34 @@ int user_allowed_by_security_group(Client *client, SecurityGroup *s)
 		if ((s->connect_time < 0) && (connect_time < 0 - s->connect_time))
 			goto user_allowed;
 	}
-	if (s->tls && (IsSecureConnect(client) || (MyConnect(client) && IsSecure(client))))
+	/* The following check for 'tls' means:
+	 * - If the user has user mode +z
+	 * - Or, if the user is local but NOT a user, e.g. the user is in
+	 *   pre-connect-stage, then check if the underlying connection
+	 *   is using SSL/TLS.
+	 * The reason for this is that:
+	 * - We want this security group / match to work in both pre-connect
+	 *   and post-connect stage.
+	 * - In post-connect stage we should only check for +z.
+	 *   This because it may be a situation of: user--proxy--us where
+	 *   the proxy--us connection is SSL/TLS so IsSecure() returns true
+	 *   but the user--proxy connection is not on SSL/TLS. We deal with
+	 *   that situation elsewhere by stripping the +z in such a case
+	 *   and we should behave the same way here, seeing it as non-TLS.
+	 */
+	if (s->tls && (IsSecureConnect(client) || (MyConnect(client) && !IsUser(client) && IsSecure(client))))
 		goto user_allowed;
 	if (s->mask && unreal_mask_match(client, s->mask))
 		goto user_allowed;
 	if (s->ip && unreal_match_iplist(client, s->ip))
 		goto user_allowed;
-	if (s->rule && user_allowed_by_rule(client, s->rule))
+	if (s->rule && crule_eval(context, s->rule))
 		goto user_allowed;
 	if (s->extended && user_matches_extended_list(client, s->extended))
 		goto user_allowed;
 	if (s->security_group && user_allowed_by_security_group_list(client, s->security_group))
+		goto user_allowed;
+	if (s->destination && context->destination && find_name_list_match(s->destination, context->destination))
 		goto user_allowed;
 
 user_not_allowed:
@@ -892,6 +941,16 @@ user_not_allowed:
 user_allowed:
 	recursion_security_group--;
 	return 1;
+}
+
+int user_allowed_by_security_group(Client *client, SecurityGroup *s)
+{
+	crule_context context;
+
+	memset(&context, 0, sizeof(context));
+	context.client = client;
+
+	return user_allowed_by_security_group_context(client, s, &context);
 }
 
 /** Returns 1 if the user is OK as far as the security-group is concerned - "by name" version.

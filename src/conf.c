@@ -47,7 +47,6 @@ static int	_conf_tld		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_listen		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_allow		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_except		(ConfigFile *conf, ConfigEntry *ce);
-static int	_conf_vhost		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_link		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_ban		(ConfigFile *conf, ConfigEntry *ce);
 static int	_conf_set		(ConfigFile *conf, ConfigEntry *ce);
@@ -82,7 +81,6 @@ static int	_test_tld		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_listen		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_allow		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_except		(ConfigFile *conf, ConfigEntry *ce);
-static int	_test_vhost		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_link		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_ban		(ConfigFile *conf, ConfigEntry *ce);
 static int	_test_require		(ConfigFile *conf, ConfigEntry *ce);
@@ -129,7 +127,6 @@ static ConfigCommand _ConfigCommands[] = {
 	{ "sni",		_conf_sni,		_test_sni	},
 	{ "tld",		_conf_tld,		_test_tld	},
 	{ "ulines",		_conf_ulines,		_test_ulines	},
-	{ "vhost", 		_conf_vhost,		_test_vhost	},
 	{ "webirc", 		_conf_proxy,		_test_proxy	},
 };
 
@@ -227,7 +224,6 @@ ConfigItem_operclass	*conf_operclass = NULL;
 ConfigItem_listen	*conf_listen = NULL;
 ConfigItem_sni		*conf_sni = NULL;
 ConfigItem_allow	*conf_allow = NULL;
-ConfigItem_vhost	*conf_vhost = NULL;
 ConfigItem_link		*conf_link = NULL;
 ConfigItem_ban		*conf_ban = NULL;
 ConfigItem_deny_channel *conf_deny_channel = NULL;
@@ -273,6 +269,7 @@ int is_blacklisted_module(const char *name);
 int modules_default_conf_modified(const char *filebuf);
 int config_item_allowed_for_config_file(const char *resource, const char *item);
 void remove_config_tkls(int flag);
+void free_operclass_struct(OperClass *o);
 
 /** Return the printable string of a 'cep' location, such as set::something::xyz */
 const char *config_var(ConfigEntry *cep)
@@ -1165,6 +1162,10 @@ ConfigFile *config_parse_with_offset(const char *filename, char *confdata, unsig
 						{
 							ptr++;
 							break;
+						} else if ((*ptr == '/') && (*(ptr+1) == '*'))
+						{
+							config_warn("%s:%i nested comments are not supported (comment started at line %d)\n",
+								filename, linenumber, commentstart);
 						}
 					}
 					if (!*ptr)
@@ -1286,7 +1287,7 @@ ConfigFile *config_parse_with_offset(const char *filename, char *confdata, unsig
 				{
 					if (preprocessor_level == 0)
 					{
-						config_error("%s:%i: @endif unexpected. There was no preciding unclosed @if.",
+						config_error("%s:%i: @endif unexpected. There was no preceding unclosed @if.",
 							filename, linenumber);
 						errors++;
 					}
@@ -1654,6 +1655,7 @@ void free_iConf(Configuration *i)
 	safe_free(i->gline_address);
 	safe_free(i->oper_snomask);
 	safe_free(i->oper_auto_join_chans);
+	safe_free(i->oper_vhost);
 	safe_free(i->allow_user_stats);
 	// allow_user_stats_ext is freed elsewhere
 	free_tls_options(i->tls_options);
@@ -1669,7 +1671,7 @@ void free_iConf(Configuration *i)
 	safe_free(i->level_on_join);
 	safe_free(i->spamfilter_ban_reason);
 	safe_free(i->spamfilter_virus_help_channel);
-	// spamexcept is freed elsewhere
+	safe_free_security_group(i->spamfilter_except);
 	safe_free(i->spamexcept_line);
 	safe_free(i->reject_message_too_many_connections);
 	safe_free(i->reject_message_server_full);
@@ -1696,6 +1698,9 @@ void free_iConf(Configuration *i)
 		free_floodsettings(f);
 	}
 	i->floodsettings = NULL;
+
+	/* And zero out everything, too easy to make a mistake above. */
+	memset(i, 0, sizeof(Configuration));
 }
 
 /** Set default set { } block settings. Note that some of these settings
@@ -1787,16 +1792,13 @@ void config_setdefaultsettings(Configuration *i)
 	safe_strdup(i->tls_options->ciphers, UNREALIRCD_DEFAULT_CIPHERS);
 	safe_strdup(i->tls_options->ciphersuites, UNREALIRCD_DEFAULT_CIPHERSUITES);
 	i->tls_options->protocols = TLS_PROTOCOL_TLSV1_2|TLS_PROTOCOL_TLSV1_3; /* TLSv1.2 & TLSv1.3 */
-#ifdef HAS_SSL_CTX_SET1_CURVES_LIST
-	safe_strdup(i->tls_options->ecdh_curves, UNREALIRCD_DEFAULT_ECDH_CURVES);
-#endif
 	safe_strdup(i->tls_options->outdated_protocols, "TLSv1,TLSv1.1");
 	/* the following may look strange but "AES*" matches all
 	 * AES ciphersuites that do not have Forward Secrecy.
 	 * Any decent client using AES will use ECDHE-xx-AES.
 	 */
 	safe_strdup(i->tls_options->outdated_ciphers, "AES*,RC4*,DES*");
-
+	i->tls_options->certificate_expiry_notification = 1;
 	i->plaintext_policy_user = POLICY_ALLOW;
 	i->plaintext_policy_oper = POLICY_DENY;
 	i->plaintext_policy_server = POLICY_DENY;
@@ -2067,6 +2069,8 @@ int config_read_start(void)
 		return -1;
 	}
 
+	init_config_defines();
+
 	/* We set this to 1 because otherwise we may call rehash_internal()
 	 * already from config_read_file() which is too soon (race).
 	 */
@@ -2125,7 +2129,6 @@ int config_test(void)
 	config_setdefaultsettings(&tempiConf);
 	clicap_pre_rehash();
 	log_pre_rehash();
-	free_config_defines();
 
 	if (!config_loadmodules())
 	{
@@ -2437,6 +2440,7 @@ void free_all_proxy_blocks(void)
 void config_rehash()
 {
 	ConfigItem_oper			*oper_ptr;
+	ConfigItem_operclass		*operclass_ptr;
 	ConfigItem_class 		*class_ptr;
 	ConfigItem_ulines 		*uline_ptr;
 	ConfigItem_allow 		*allow_ptr;
@@ -2444,7 +2448,6 @@ void config_rehash()
 	ConfigItem_link 		*link_ptr;
 	ConfigItem_listen	 	*listen_ptr;
 	ConfigItem_tld			*tld_ptr;
-	ConfigItem_vhost		*vhost_ptr;
 	ConfigItem_deny_channel		*deny_channel_ptr;
 	ConfigItem_allow_channel	*allow_channel_ptr;
 	ConfigItem_admin		*admin_ptr;
@@ -2455,7 +2458,6 @@ void config_rehash()
 	ConfigItem_sni			*sni;
 	OperStat 			*os_ptr;
 	ListStruct 	*next, *next2;
-	SpamExcept *spamex_ptr;
 
 	USE_BAN_VERSION = 0;
 
@@ -2478,7 +2480,6 @@ void config_rehash()
 		safe_free(oper_ptr->auto_join);
 		Auth_FreeAuthConfig(oper_ptr->auth);
 		free_security_group(oper_ptr->match);
-		DelListItem(oper_ptr, conf_oper);
 		for (s = oper_ptr->swhois; s; s = s_next)
 		{
 			s_next = s->next;
@@ -2486,7 +2487,16 @@ void config_rehash()
 			safe_free(s->setby);
 			safe_free(s);
 		}
+		DelListItem(oper_ptr, conf_oper);
 		safe_free(oper_ptr);
+	}
+
+	for (operclass_ptr = conf_operclass; operclass_ptr; operclass_ptr = (ConfigItem_operclass *)next)
+	{
+		next = (ListStruct *)operclass_ptr->next;
+		free_operclass_struct(operclass_ptr->classStruct);
+		DelListItem(operclass_ptr, conf_operclass);
+		safe_free(operclass_ptr);
 	}
 
 	for (link_ptr = conf_link; link_ptr; link_ptr = (ConfigItem_link *) next)
@@ -2566,27 +2576,6 @@ void config_rehash()
 
 		DelListItem(tld_ptr, conf_tld);
 		safe_free(tld_ptr);
-	}
-	for (vhost_ptr = conf_vhost; vhost_ptr; vhost_ptr = (ConfigItem_vhost *) next)
-	{
-		SWhois *s, *s_next;
-
-		next = (ListStruct *)vhost_ptr->next;
-
-		safe_free(vhost_ptr->login);
-		Auth_FreeAuthConfig(vhost_ptr->auth);
-		safe_free(vhost_ptr->virthost);
-		safe_free(vhost_ptr->virtuser);
-		free_security_group(vhost_ptr->match);
-		for (s = vhost_ptr->swhois; s; s = s_next)
-		{
-			s_next = s->next;
-			safe_free(s->line);
-			safe_free(s->setby);
-			safe_free(s);
-		}
-		DelListItem(vhost_ptr, conf_vhost);
-		safe_free(vhost_ptr);
 	}
 
 	remove_config_tkls(TKL_FLAG_CONFIG);
@@ -2672,12 +2661,6 @@ void config_rehash()
 		safe_free(os_ptr);
 	}
 	iConf.allow_user_stats_ext = NULL;
-	for (spamex_ptr = iConf.spamexcept; spamex_ptr; spamex_ptr = (SpamExcept *)next)
-	{
-		next = (ListStruct *)spamex_ptr->next;
-		safe_free(spamex_ptr);
-	}
-	iConf.spamexcept = NULL;
 	for (of_ptr = conf_offchans; of_ptr; of_ptr = (ConfigItem_offchans *)next)
 	{
 		next = (ListStruct *)of_ptr->next;
@@ -3084,7 +3067,6 @@ int config_run_blocks(void)
 	listen_cleanup();
 	loop.do_bancheck = 1;
 	config_switchover();
-	update_throttling_timer_settings();
 
 	/* initialize conf_files with defaults if the block isn't set: */
 	if (!conf_files)
@@ -3315,20 +3297,6 @@ ConfigItem_ban 	*find_banEx(Client *client, const char *host, short type, short 
 	}
 	return NULL;
 }
-
-ConfigItem_vhost *find_vhost(const char *name)
-{
-	ConfigItem_vhost *vhost;
-
-	for (vhost = conf_vhost; vhost; vhost = vhost->next)
-	{
-		if (!strcmp(name, vhost->login))
-			return vhost;
-	}
-
-	return NULL;
-}
-
 
 /** returns NULL if allowed and struct if denied */
 ConfigItem_deny_channel *find_channel_allowed(Client *client, const char *name)
@@ -4032,6 +4000,58 @@ OperClassACL* _conf_parseACL(const char *name, ConfigEntry *ce)
 	return acl;
 }
 
+/** Free previously allocated _conf_parseACLEntry() */
+void free_acl_entry(OperClassACLEntry *e)
+{
+	OperClassACLEntryVar *v, *v_next;
+
+	for (v = e->variables; v; v = v_next)
+	{
+		v_next = v->next;
+		safe_free(v->name);
+		safe_free(v->value);
+		safe_free(v);
+	}
+	safe_free(e);
+}
+
+/** Free previously allocated _conf_parseACL() */
+void free_operclass_acls(OperClassACL *acl)
+{
+	OperClassACL *acl_next;
+	OperClassACLEntry *x, *x_next;
+	OperClassACL *sub, *sub_next;
+
+	for (; acl; acl = acl_next)
+	{
+		acl_next = acl->next;
+		for (x = acl->entries; x; x = x_next)
+		{
+			x_next = x->next;
+			DelListItem(x, acl->entries);
+			free_acl_entry(x);
+		}
+		acl->entries = NULL;
+		for (sub = acl->acls; sub; sub = sub_next)
+		{
+			sub_next = sub->next;
+			DelListItem(sub, acl->acls);
+			free_operclass_acls(sub);
+		}
+		acl->acls = NULL;
+		safe_free(acl->name);
+		safe_free(acl);
+	}
+}
+
+void free_operclass_struct(OperClass *o)
+{
+	free_operclass_acls(o->acls);
+	safe_free(o->ISA);
+	safe_free(o->name);
+	safe_free(o);
+}
+
 int	_conf_operclass(ConfigFile *conf, ConfigEntry *ce)
 {
 	ConfigEntry *cep;
@@ -4102,11 +4122,22 @@ int 	_test_operclass(ConfigFile *conf, ConfigEntry *ce)
 	{
 		if (!strcmp(cep->name, "parent"))
 		{
+			CheckNull(cep);
 			if (has_parent)
 			{
 				config_warn_duplicate(cep->file->filename,
 					cep->line_number, "operclass::parent");
 				continue;
+			}
+			/* A -direct- loop is easy to detect.
+			 * We also have code elsewhere to detect loops
+			 * like a->b->a->b->a->b.
+			 */
+			if (ce->value && !strcmp(cep->value, ce->value))
+			{
+				config_error("%s:%d: operclass %s has parent set to %s (same name).",
+				            cep->file->filename, cep->line_number, ce->name, cep->value);
+				errors++;
 			}
 			has_parent = 1;
 			continue;
@@ -4116,7 +4147,7 @@ int 	_test_operclass(ConfigFile *conf, ConfigEntry *ce)
 			if (has_permissions)
 			{
 				config_warn_duplicate(cep->file->filename,
-				cep->line_number, "oper::permissions");
+				cep->line_number, "operclass::permissions");
 				continue;
 			}
 			has_permissions = 1;
@@ -4139,7 +4170,7 @@ int 	_test_operclass(ConfigFile *conf, ConfigEntry *ce)
 	if (!has_permissions)
 	{
 		config_error_missing(ce->file->filename, ce->line_number,
-			"oper::permissions");
+			"operclass::permissions");
 		errors++;
 	}
 
@@ -4280,8 +4311,6 @@ int	_test_oper(ConfigFile *conf, ConfigEntry *ce)
 					continue;
 				}
 				has_password = 1;
-				if (Auth_CheckError(cep, 1) < 0)
-					errors++;
 
 				if (ce->value && cep->value &&
 					!strcmp(ce->value, "bobsmith") &&
@@ -4291,7 +4320,12 @@ int	_test_oper(ConfigFile *conf, ConfigEntry *ce)
 								 "default 'bobsmith' oper block",
 								 ce->file->filename, ce->line_number);
 					errors++;
+					continue;
 				}
+
+				if (Auth_CheckError(cep, 1) < 0)
+					errors++;
+
 				continue;
 			}
 			/* oper::operclass */
@@ -4330,7 +4364,7 @@ int	_test_oper(ConfigFile *conf, ConfigEntry *ce)
 						cep->line_number, "oper::vhost");
 					continue;
 				}
-				if (!valid_vhost(cep->value))
+				if (!potentially_valid_vhost(cep->value))
 				{
 					config_error("%s:%i: oper::vhost contains illegal characters or is too long: '%s'",
 					             cep->file->filename, cep->line_number, cep->value);
@@ -5349,6 +5383,7 @@ void conf_listen_configure(const char *ip, int port, SocketType socket_type, int
 	}
 	safe_free_webserver(listen->webserver);
 	free_entire_name_list(listen->websocket_origin);
+	listen->websocket_options = 0;
 	// NOTE: duplicate code overlap with listen_cleanup()
 
 	/* Now set the new settings: */
@@ -5670,6 +5705,13 @@ int	_test_listen(ConfigFile *conf, ConfigEntry *ce)
 
 			has_port = 1;
 
+			if (strchr(cep->value, ','))
+			{
+				config_error("%s:%i: listen::port does not support comma's",
+				             cep->file->filename, cep->line_number);
+				errors++;
+				continue;
+			}
 			port_range(cep->value, &start, &end);
 			if (start == end)
 			{
@@ -5677,7 +5719,8 @@ int	_test_listen(ConfigFile *conf, ConfigEntry *ce)
 				{
 					config_error("%s:%i: listen: illegal port (must be 1..65535)",
 						cep->file->filename, cep->line_number);
-					return 1;
+					errors++;
+					continue;
 				}
 			}
 			else
@@ -5686,7 +5729,8 @@ int	_test_listen(ConfigFile *conf, ConfigEntry *ce)
 				{
 					config_error("%s:%i: listen: illegal port range end value is less than starting value",
 						cep->file->filename, cep->line_number);
-					return 1;
+					errors++;
+					continue;
 				}
 				if (end - start >= 100)
 				{
@@ -5694,13 +5738,15 @@ int	_test_listen(ConfigFile *conf, ConfigEntry *ce)
 						"(and thus consumes %d sockets) this is probably not what you want.",
 						cep->file->filename, cep->line_number, start, end,
 						end - start + 1, end - start + 1);
-					return 1;
+					errors++;
+					continue;
 				}
 				if ((start < 1) || (start > 65535) || (end < 1) || (end > 65535))
 				{
 					config_error("%s:%i: listen: illegal port range values must be between 1 and 65535",
 						cep->file->filename, cep->line_number);
-					return 1;
+					errors++;
+					continue;
 				}
 			}
 
@@ -6321,187 +6367,6 @@ int _test_except(ConfigFile *conf, ConfigEntry *ce)
 		return 1;
 	}
 
-	return errors;
-}
-
-/*
- * vhost {} block parser
-*/
-int	_conf_vhost(ConfigFile *conf, ConfigEntry *ce)
-{
-	ConfigItem_vhost *vhost;
-	ConfigEntry *cep, *cepp;
-	vhost = safe_alloc(sizeof(ConfigItem_vhost));
-	vhost->match = safe_alloc(sizeof(SecurityGroup));
-
-	for (cep = ce->items; cep; cep = cep->next)
-	{
-		if (!strcmp(cep->name, "vhost"))
-		{
-			char *user, *host;
-			user = strtok(cep->value, "@");
-			host = strtok(NULL, "");
-			if (!host)
-				safe_strdup(vhost->virthost, user);
-			else
-			{
-				safe_strdup(vhost->virtuser, user);
-				safe_strdup(vhost->virthost, host);
-			}
-		}
-		else if (!strcmp(cep->name, "login"))
-			safe_strdup(vhost->login, cep->value);
-		else if (!strcmp(cep->name, "password"))
-			vhost->auth = AuthBlockToAuthConfig(cep);
-		else if (!strcmp(cep->name, "match") || !strcmp(cep->name, "mask"))
-		{
-			conf_match_block(conf, cep, &vhost->match);
-		}
-		else if (!strcmp(cep->name, "swhois"))
-		{
-			SWhois *s;
-			if (cep->items)
-			{
-				for (cepp = cep->items; cepp; cepp = cepp->next)
-				{
-					s = safe_alloc(sizeof(SWhois));
-					safe_strdup(s->line, cepp->name);
-					safe_strdup(s->setby, "vhost");
-					AddListItem(s, vhost->swhois);
-				}
-			} else
-			if (cep->value)
-			{
-				s = safe_alloc(sizeof(SWhois));
-				safe_strdup(s->line, cep->value);
-				safe_strdup(s->setby, "vhost");
-				AddListItem(s, vhost->swhois);
-			}
-		}
-	}
-	AddListItem(vhost, conf_vhost);
-	return 1;
-}
-
-int	_test_vhost(ConfigFile *conf, ConfigEntry *ce)
-{
-	int errors = 0;
-	ConfigEntry *cep;
-	char has_vhost = 0, has_login = 0, has_password = 0, has_mask = 0, has_match = 0;
-
-	for (cep = ce->items; cep; cep = cep->next)
-	{
-		if (!strcmp(cep->name, "vhost"))
-		{
-			char *at, *tmp, *host;
-			if (has_vhost)
-			{
-				config_warn_duplicate(cep->file->filename,
-					cep->line_number, "vhost::vhost");
-				continue;
-			}
-			has_vhost = 1;
-			if (!cep->value)
-			{
-				config_error_empty(cep->file->filename,
-					cep->line_number, "vhost", "vhost");
-				errors++;
-				continue;
-			}
-			if (!valid_vhost(cep->value))
-			{
-				config_error("%s:%i: oper::vhost contains illegal characters or is too long: '%s'",
-					     cep->file->filename, cep->line_number, cep->value);
-				errors++;
-			}
-		}
-		else if (!strcmp(cep->name, "login"))
-		{
-			if (has_login)
-			{
-				config_warn_duplicate(cep->file->filename,
-					cep->line_number, "vhost::login");
-			}
-			has_login = 1;
-			if (!cep->value)
-			{
-				config_error_empty(cep->file->filename,
-					cep->line_number, "vhost", "login");
-				errors++;
-				continue;
-			}
-		}
-		else if (!strcmp(cep->name, "password"))
-		{
-			if (has_password)
-			{
-				config_warn_duplicate(cep->file->filename,
-					cep->line_number, "vhost::password");
-			}
-			has_password = 1;
-			if (!cep->value)
-			{
-				config_error_empty(cep->file->filename,
-					cep->line_number, "vhost", "password");
-				errors++;
-				continue;
-			}
-			if (Auth_CheckError(cep, 0) < 0)
-				errors++;
-		}
-		else if (!strcmp(cep->name, "mask"))
-		{
-			has_mask = 1;
-			test_match_block(conf, cep, &errors);
-		}
-		else if (!strcmp(cep->name, "match"))
-		{
-			has_match = 1;
-			test_match_block(conf, cep, &errors);
-		}
-		else if (!strcmp(cep->name, "swhois"))
-		{
-			/* multiple is ok */
-		}
-		else
-		{
-			config_error_unknown(cep->file->filename, cep->line_number,
-				"vhost", cep->name);
-			errors++;
-		}
-	}
-	if (!has_vhost)
-	{
-		config_error_missing(ce->file->filename, ce->line_number,
-			"vhost::vhost");
-		errors++;
-	}
-	if (!has_login)
-	{
-		config_error_missing(ce->file->filename, ce->line_number,
-			"vhost::login");
-		errors++;
-
-	}
-	if (!has_password)
-	{
-		config_error_missing(ce->file->filename, ce->line_number,
-			"vhost::password");
-		errors++;
-	}
-	if (!has_mask && !has_match)
-	{
-		config_error_missing(ce->file->filename, ce->line_number,
-			"vhost::match");
-		errors++;
-	}
-	if (has_mask && has_match)
-	{
-		config_error("%s:%d: You cannot have both ::mask and ::match. "
-		             "You should only use %s::match.",
-		             ce->file->filename, ce->line_number, ce->name);
-		errors++;
-	}
 	return errors;
 }
 
@@ -7194,8 +7059,7 @@ int _conf_require(ConfigFile *conf, ConfigEntry *ce)
 {
 	ConfigEntry *cep;
 	Hook *h;
-	char *usermask = NULL;
-	char *hostmask = NULL;
+	SecurityGroup *match = NULL;
 	char *reason = NULL;
 
 	if (strcmp(ce->value, "authentication") && strcmp(ce->value, "sasl"))
@@ -7213,33 +7077,16 @@ int _conf_require(ConfigFile *conf, ConfigEntry *ce)
 
 	for (cep = ce->items; cep; cep = cep->next)
 	{
-		if (!strcmp(cep->name, "mask"))
-		{
-			char buf[512], *p;
-			strlcpy(buf, cep->value, sizeof(buf));
-			p = strchr(buf, '@');
-			if (p)
-			{
-				*p++ = '\0';
-				safe_strdup(usermask, buf);
-				safe_strdup(hostmask, p);
-			} else {
-				safe_strdup(hostmask, cep->value);
-			}
-		}
+		if (!strcmp(cep->name, "match") || !strcmp(cep->name, "mask"))
+			conf_match_block(conf, cep, &match);
 		else if (!strcmp(cep->name, "reason"))
 			safe_strdup(reason, cep->value);
 	}
 
-	if (!usermask)
-		safe_strdup(usermask, "*");
-
 	if (!reason)
 		safe_strdup(reason, "-");
 
-	tkl_add_serverban(TKL_KILL, usermask, hostmask, reason, "-config-", 0, TStime(), 1, TKL_FLAG_CONFIG);
-	safe_free(usermask);
-	safe_free(hostmask);
+	tkl_add_serverban(TKL_KILL, NULL, NULL, match, reason, "-config-", 0, TStime(), 1, TKL_FLAG_CONFIG);
 	safe_free(reason);
 	return 0;
 }
@@ -7249,7 +7096,7 @@ int _test_require(ConfigFile *conf, ConfigEntry *ce)
 	ConfigEntry *cep;
 	int errors = 0;
 	Hook *h;
-	char has_mask = 0, has_reason = 0;
+	char has_mask = 0, has_match = 0, has_reason = 0;
 
 	if (!ce->value)
 	{
@@ -7304,20 +7151,26 @@ int _test_require(ConfigFile *conf, ConfigEntry *ce)
 
 	for (cep = ce->items; cep; cep = cep->next)
 	{
+		if (!strcmp(cep->name, "mask"))
+		{
+			if (cep->value || cep->items)
+			{
+				has_mask = 1;
+				test_match_block(conf, cep, &errors);
+			}
+		} else
+		if (!strcmp(cep->name, "match"))
+		{
+			if (cep->value || cep->items)
+			{
+				has_match = 1;
+				test_match_block(conf, cep, &errors);
+			}
+		} else
 		if (config_is_blankorempty(cep, "require"))
 		{
 			errors++;
 			continue;
-		}
-		if (!strcmp(cep->name, "mask"))
-		{
-			if (has_mask)
-			{
-				config_warn_duplicate(cep->file->filename,
-					cep->line_number, "require::mask");
-				continue;
-			}
-			has_mask = 1;
 		}
 		else if (!strcmp(cep->name, "reason"))
 		{
@@ -7328,15 +7181,30 @@ int _test_require(ConfigFile *conf, ConfigEntry *ce)
 				continue;
 			}
 			has_reason = 1;
+		} else
+		{
+			config_error_unknown(cep->file->filename,
+				cep->line_number, "require", cep->name);
+			errors++;
+			continue;
 		}
 	}
 
-	if (!has_mask)
+	if (!has_mask && !has_match)
 	{
 		config_error_missing(ce->file->filename, ce->line_number,
 			"require::mask");
 		errors++;
 	}
+
+	if (has_mask && has_match)
+	{
+		config_error("%s:%d: You cannot have both ::mask and ::match. "
+		             "You should only use require::match.",
+		             ce->file->filename, ce->line_number);
+		errors++;
+	}
+
 	if (!has_reason)
 	{
 		config_error_missing(ce->file->filename, ce->line_number,
@@ -7571,6 +7439,9 @@ void test_tlsblock(ConfigFile *conf, ConfigEntry *cep, int *totalerrors)
 				errors++;
 			}
 		}
+		else if (!strcmp(cepp->name, "certificate-expiry-notification"))
+		{
+		}
 		else
 		{
 			config_error("%s:%i: unknown directive %s",
@@ -7623,6 +7494,7 @@ void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions)
 		tlsoptions->sts_port = tempiConf.tls_options->sts_port;
 		tlsoptions->sts_duration = tempiConf.tls_options->sts_duration;
 		tlsoptions->sts_preload = tempiConf.tls_options->sts_preload;
+		tlsoptions->certificate_expiry_notification = tempiConf.tls_options->certificate_expiry_notification;
 	}
 
 	/* Now process the options */
@@ -7737,6 +7609,10 @@ void conf_tlsblock(ConfigFile *conf, ConfigEntry *cep, TLSOptions *tlsoptions)
 					tlsoptions->sts_preload = config_checkval(ceppp->value, CFG_YESNO);
 			}
 		}
+		else if (!strcmp(cepp->name, "certificate-expiry-notification"))
+		{
+			tlsoptions->certificate_expiry_notification = config_checkval(cepp->value, CFG_YESNO);
+		}
 	}
 }
 
@@ -7808,6 +7684,9 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 		}
 		else if (!strcmp(cep->name, "oper-auto-join")) {
 			safe_strdup(tempiConf.oper_auto_join_chans, cep->value);
+		}
+		else if (!strcmp(cep->name, "oper-vhost")) {
+			safe_strdup(tempiConf.oper_vhost, cep->value);
 		}
 		else if (!strcmp(cep->name, "check-target-nick-bans")) {
 			tempiConf.check_target_nick_bans = config_checkval(cep->value, CFG_YESNO);
@@ -7923,6 +7802,9 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 				tempiConf.hide_ban_reason = HIDE_BAN_REASON_NO;
 			else if (!strcmp(cep->value, "auto"))
 				tempiConf.hide_ban_reason = HIDE_BAN_REASON_AUTO;
+		}
+		else if (!strcmp(cep->name, "hide-killed-by")) {
+			tempiConf.hide_killed_by = config_checkval(cep->value, CFG_YESNO);
 		}
 		else if (!strcmp(cep->name, "prefix-quit")) {
 			if (!strcmp(cep->value, "0") || !strcmp(cep->value, "no"))
@@ -8116,19 +7998,20 @@ int	_conf_set(ConfigFile *conf, ConfigEntry *ce)
 					tempiConf.spamfilter_vchan_deny = config_checkval(cepp->value,CFG_YESNO);
 				else if (!strcmp(cepp->name, "except"))
 				{
-					char *name, *p;
-					SpamExcept *e;
-					safe_strdup(tempiConf.spamexcept_line, cepp->value);
-					for (name = strtoken(&p, cepp->value, ","); name; name = strtoken(&p, NULL, ","))
+					if (cepp->value && !tempiConf.spamfilter_except)
 					{
-						if (*name == ' ')
-							name++;
-						if (*name)
+						/* OLD set::spamfilter::except compatibility code when it was "#chan,xyz" */
+						char buf[512], *p = NULL, *name;
+						strlcpy(buf, cepp->value, sizeof(buf));
+						tempiConf.spamfilter_except = safe_alloc(sizeof(SecurityGroup));
+						for (name = strtoken(&p, buf, ","); name; name = strtoken(&p, NULL, ","))
 						{
-							e = safe_alloc(sizeof(SpamExcept) + strlen(name));
-							strcpy(e->name, name);
-							AddListItem(e, tempiConf.spamexcept);
+							skip_whitespace(&name);
+							add_name_list(tempiConf.spamfilter_except->destination, name);
 						}
+					} else {
+						/* New set::spamfilter::except code, where it is a mask item */
+						conf_match_block(conf, cepp, &tempiConf.spamfilter_except);
 					}
 				}
 				else if (!strcmp(cepp->name, "detect-slow-warn"))
@@ -8545,6 +8428,15 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 			CheckNull(cep);
 			CheckDuplicate(cep, oper_auto_join, "oper-auto-join");
 		}
+		else if (!strcmp(cep->name, "oper-vhost")) {
+			CheckNull(cep);
+			if (!potentially_valid_vhost(cep->value))
+			{
+				config_error("%s:%i: set::oper-vhost contains illegal characters or is too long: '%s'",
+					     cep->file->filename, cep->line_number, cep->value);
+				errors++;
+			}
+		}
 		else if (!strcmp(cep->name, "check-target-nick-bans")) {
 			CheckNull(cep);
 			CheckDuplicate(cep, check_target_nick_bans, "check-target-nick-bans");
@@ -8732,6 +8624,10 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 				errors++;
 				continue;
 			}
+		}
+		else if (!strcmp(cep->name, "hide-killed-by")) {
+			CheckNull(cep);
+			CheckDuplicate(cep, hide_killed_by, "hide-killed-by");
 		}
 		else if (!strcmp(cep->name, "restrict-channelmodes"))
 		{
@@ -9265,6 +9161,23 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 		else if (!strcmp(cep->name, "spamfilter")) {
 			for (cepp = cep->items; cepp; cepp = cepp->next)
 			{
+				if (!strcmp(cepp->name, "except"))
+				{
+					if (cepp->value)
+					{
+						/* Old compatibility code */
+						config_warn("%s: %d: set::spamfilter::except is now a mask item. "
+						            "Your setting has been read correctly but please update your item "
+						            "because future UnrealIRCd versions will make this an error. "
+						            "Update your item to use this style: "
+						            "except { destination { \"#chan1\"; \"#chan2\"; \"SomeNick\"; } }",
+						            cepp->file->filename, cepp->line_number);
+						config_warn("For more information, see https://www.unrealircd.org/docs/Set_block#set::spamfilter::except");
+					} else {
+						test_match_block(conf, cepp, &errors);
+					}
+					continue; // needed, because we are above the CheckNull and the multiple if's below.
+				}
 				CheckNull(cepp);
 				if (!strcmp(cepp->name, "ban-time"))
 				{
@@ -9300,10 +9213,6 @@ int	_test_set(ConfigFile *conf, ConfigEntry *ce)
 				if (!strcmp(cepp->name, "virus-help-channel-deny"))
 				{
 					CheckDuplicate(cepp, spamfilter_virus_help_channel_deny, "spamfilter::virus-help-channel-deny");
-				} else
-				if (!strcmp(cepp->name, "except"))
-				{
-					CheckDuplicate(cepp, spamfilter_except, "spamfilter::except");
 				} else
 #ifdef SPAMFILTER_DETECTSLOW
 				if (!strcmp(cepp->name, "detect-slow-warn"))
@@ -9994,10 +9903,12 @@ void start_listeners(void)
 {
 	ConfigItem_listen *listener;
 	int failed = 0, ports_bound = 0;
-	char boundmsg_ipv4[512], boundmsg_ipv6[512];
+	char boundmsg_ipv4[512];
+	char boundmsg_ipv6[512];
+	char boundmsg_unix[512];
 	int last_errno = 0;
 
-	*boundmsg_ipv4 = *boundmsg_ipv6 = '\0';
+	*boundmsg_ipv4 = *boundmsg_ipv6 = *boundmsg_unix = '\0';
 
 	for (listener = conf_listen; listener; listener = listener->next)
 	{
@@ -10012,10 +9923,19 @@ void start_listeners(void)
 			} else {
 				if (loop.booted)
 				{
-					unreal_log(ULOG_INFO, "listen", "LISTEN_ADDED", NULL,
-					           "UnrealIRCd is now also listening on $listen_ip:$listen_port",
-					           log_data_string("listen_ip", listener->ip),
-					           log_data_integer("listen_port", listener->port));
+					if (listener->socket_type == SOCKET_TYPE_UNIX)
+					{
+						unreal_log(ULOG_INFO, "listen", "LISTEN_ADDED", NULL,
+							   "UnrealIRCd is now also listening on $listen_file [$protocol]",
+							   log_data_string("listen_file", listener->file),
+							   log_data_string("protocol", socket_type_valtostr(listener->socket_type)));
+					} else {
+						unreal_log(ULOG_INFO, "listen", "LISTEN_ADDED", NULL,
+							   "UnrealIRCd is now also listening on $listen_ip:$listen_port [$protocol]",
+							   log_data_string("listen_ip", listener->ip),
+							   log_data_integer("listen_port", listener->port),
+							   log_data_string("protocol", socket_type_valtostr(listener->socket_type)));
+					}
 				} else {
 					switch (listener->socket_type)
 					{
@@ -10029,7 +9949,11 @@ void start_listeners(void)
 								"%s:%d%s, ", listener->ip, listener->port,
 								listener->options & LISTENER_TLS ? "(TLS)" : "");
 							break;
-						// TODO: show unix domain sockets ;)
+						case SOCKET_TYPE_UNIX:
+							snprintf(boundmsg_unix+strlen(boundmsg_unix), sizeof(boundmsg_unix)-strlen(boundmsg_unix),
+								"%s%s, ", listener->file,
+								listener->options & LISTENER_TLS ? "(TLS)" : "");
+							break;
 						default:
 							break;
 					}
@@ -10082,24 +10006,32 @@ void start_listeners(void)
 			boundmsg_ipv4[strlen(boundmsg_ipv4)-2] = '\0';
 		if (strlen(boundmsg_ipv6) > 2)
 			boundmsg_ipv6[strlen(boundmsg_ipv6)-2] = '\0';
+		if (strlen(boundmsg_unix) > 2)
+			boundmsg_unix[strlen(boundmsg_unix)-2] = '\0';
 
 		if (!*boundmsg_ipv4)
 			strlcpy(boundmsg_ipv4, "<none>", sizeof(boundmsg_ipv4));
 		if (!*boundmsg_ipv6)
 			strlcpy(boundmsg_ipv6, "<none>", sizeof(boundmsg_ipv6));
+		if (!*boundmsg_unix)
+			strlcpy(boundmsg_unix, "<none>", sizeof(boundmsg_unix));
 
 		unreal_log(ULOG_INFO, "listen", "LISTENING", NULL,
 		           "UnrealIRCd is now listening on the following addresses/ports:\n"
 		           "IPv4: $ipv4_port_list\n"
-		           "IPv6: $ipv6_port_list\n",
+		           "IPv6: $ipv6_port_list\n"
+		           "Unix Sockets: $unix_socket_list\n",
 		           log_data_string("ipv4_port_list", boundmsg_ipv4),
-		           log_data_string("ipv6_port_list", boundmsg_ipv6));
+		           log_data_string("ipv6_port_list", boundmsg_ipv6),
+		           log_data_string("unix_socket_list", boundmsg_unix));
 	}
 }
 
 /* Actually use configuration */
 void config_run(void)
 {
+	Module *mi;
+
 	loop.config_status = CONFIG_STATUS_POSTLOAD;
 	extcmodes_check_for_changes();
 	start_listeners();
@@ -10107,6 +10039,10 @@ void config_run(void)
 		add_proc_io_server();
 	free_all_config_resources();
 	dns_check_for_changes();
+
+	for (mi = Modules; mi; mi = mi->next)
+		if (!(mi->options & MOD_OPT_OFFICIAL))
+			tainted = 99;
 }
 
 int	_conf_offchans(ConfigFile *conf, ConfigEntry *ce)
@@ -11087,7 +11023,22 @@ void resource_download_complete(OutgoingWebRequest *request, OutgoingWebResponse
 				   log_data_string("url", displayurl(request->url)),
 				   log_data_string("error_message", response->errorbuf));
 			safe_strdup(rs->file, rs->cache_file);
-		} else {
+		} else
+		if (rs->warn_only_on_fail)
+		{
+			const char *cache_file;
+			unreal_log(ULOG_WARNING, "config", "DOWNLOAD_FAILED_WARN", NULL,
+				   "$file:$line_number: Failed to download '$url': $error_message\n"
+				   "Continuing anyway...",
+				   log_data_string("file", rs->wce->ce->file->filename),
+				   log_data_integer("line_number", rs->wce->ce->line_number),
+				   log_data_string("url", displayurl(request->url)),
+				   log_data_string("error_message", response->errorbuf));
+			cache_file = unreal_mkcache(request->url);
+			unreal_touch(cache_file, 1577880000); /* 2020-01-01 12:00 GMT */
+			safe_strdup(rs->file, cache_file);
+		} else
+		{
 			unreal_log(ULOG_ERROR, "config", "DOWNLOAD_FAILED_HARD", NULL,
 				   "$file:$line_number: Failed to download '$url': $error_message",
 				   log_data_string("file", rs->wce->ce->file->filename),
@@ -11403,11 +11354,15 @@ int add_config_resource(const char *resource, int type, ConfigEntry *ce)
 
 		cache_file = unreal_mkcache(rs->url);
 		modtime = unreal_getfilemodtime(cache_file);
+
 		if (modtime > 0)
 		{
+			/* CACHED COPY IS AVAILABLE */
+			ConfigEntry *cep, *prev;
 			safe_strdup(rs->cache_file, cache_file); /* Cached copy is available */
+
 			/* Check if there is an "url-refresh" argument */
-			ConfigEntry *cep, *prev = NULL;
+			prev = NULL;
 			for (cep = ce->items; cep; cep = cep->next)
 			{
 				if (!strcmp(cep->name, "url-refresh"))
@@ -11436,6 +11391,34 @@ int add_config_resource(const char *resource, int type, ConfigEntry *ce)
 					} else {
 						//config_status("DEBUG: requires download attempt, out of date url-refresh %ld < %ld", refresh_time, TStime() - modtime);
 					}
+					break; // MUST break now as we touched the linked list.
+				}
+				prev = cep;
+			}
+		} else {
+			/* CACHED COPY IS NOT AVAILABLE */
+			ConfigEntry *cep, *prev;
+			/* Check if there is an "url-fail" argument */
+			prev = NULL;
+			for (cep = ce->items; cep; cep = cep->next)
+			{
+				if (!strcmp(cep->name, "url-fail"))
+				{
+					if (cep->value)
+					{
+						if (!strcmp(cep->value, "warn"))
+							rs->warn_only_on_fail = 1;
+					}
+
+					/* Then remove the config item so it is not seen by the rest of unrealircd.
+					 * Can't use DelListItem() here as ConfigEntry has no ->prev, only ->next.
+					 */
+					if (prev)
+						prev->next = cep->next; /* (skip over us) */
+					else
+						ce->items = cep->next; /* (new head) */
+					/* ..and free it */
+					config_entry_free(cep);
 					break; // MUST break now as we touched the linked list.
 				}
 				prev = cep;

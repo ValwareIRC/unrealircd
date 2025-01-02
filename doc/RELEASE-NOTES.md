@@ -1,27 +1,404 @@
-UnrealIRCd 6.1.5-git
-=================
+UnrealIRCd 6.1.10-git
+===============
 
-This is the git version (development version) for future 6.1.5. This is work
+This is the git version (development version). This is work
 in progress and may not always be a stable version.
 
 ### Enhancements:
-* You can now set 
-  [oper::auto-join](https://www.unrealircd.org/docs/Oper_block#auto-join)
-  in an oper blockto override the generic
-  [set::oper-auto-join](https://www.unrealircd.org/docs/Set_block#set::oper-auto-join)
-  setting.
+* TODO
 
 ### Changes:
 * TODO
 
 ### Fixes:
-* If your shell only allowed very few file descriptors (eg: `ulimit -n`
-  returned `150`), then UnrealIRCd would fail to boot. This, because due to
-  reserved file descriptors you would have 0 left, or even a negative number.
-* +I ~operclass was not working properly.
+* TODO
 
 ### Developers and protocol:
 * TODO
+
+UnrealIRCd 6.1.9.1
+-------------------
+(UnrealIRCd 6.1.9.1 fixes a bug in the TLS ciphers of 6.1.9. The original
+ 6.1.9 release notes are below)
+
+This 6.1.9 release fixes a number of bugs such as IPv6 hosts not resolving
+in UnrealIRCd 6.1.8/6.1.8.1 and 100% CPU usage in some circumstances.
+It also changes the SSL/TLS defaults to make things a little safer/better.
+
+### Enhancements:
+* SSL/TLS:
+  * Change [default TLS ciphers](https://www.unrealircd.org/docs/TLS_Ciphers_and_protocols)
+    to only allow AES in GCM mode and no longer in CBC mode.
+  * When using cURL for [remote includes](https://www.unrealircd.org/docs/Remote_includes)
+    we now explicitly set the minimum required version to TLSv1.2 and set our
+    default ciphers and ciphersuites.
+    Note that by default in UnrealIRCd 6 the built-in (non-cURL) implementation
+    is used for remote includes, which already used these defaults.
+    Also note that most distros, like Ubuntu and Debian, already required
+    TLSv1.2 or later effectively in cURL.
+  * Regarding default ecdh-curves: we now try to set the curves list to
+    `x25519:secp521r1:secp384r1:prime256v1` first, and if that fails then
+    we try `secp521r1:secp384r1:prime256v1`. The former could fail due to
+    SSL library restrictions (old library or when in FIPS mode).
+    Previously we were also supposed to do it like that, but due to a bug
+    always had X25519 turned off.
+
+### Fixes:
+* IPv6 hosts not resolving in UnrealIRCd 6.1.8 and 6.1.8.1.
+* 100% CPU usage in some (rare) circumstances. The IRCd is still fully
+  responsive, but of course high CPU usage is never good.
+* Crash in `STATS S` (IRCOp-only) if having vhosts with autologin
+  (and no vhost::login).
+* The Windows version did not allow tweaking of set::tls::ecdh-curves.
+
+### Changes:
+* Update shipped libraries: c-ares to 1.34.3
+* Update Windows libraries: c-ares to 1.34.3, curl to 8.11.0 and
+  LibreSSL to 4.0.0.
+* Added `HELPOP EXTSERVERBANS` to explain
+  [Extended server bans](https://www.unrealircd.org/docs/Extended_server_bans)
+* Added
+  [new UnrealIRCd PGP release signing key](https://forums.unrealircd.org/viewtopic.php?p=40832)
+
+### Developers and protocol:
+* No changes, other than the SSL/TLS changes mentioned earlier.
+
+UnrealIRCd 6.1.8.1
+-------------------
+UnrealIRCd 6.1.8.1 is a dot release, it fixes:
+* If you have a vhost block without vhost::login, because you use the
+  new auto-vhost functionality, then the IRCd will crash upon
+  processing regular VHOST requests.
+* Strings were accidentally being lowercased in vhost::vhost,
+  blacklist::reason and some other places.
+
+The 6.1.8.1 release is mostly for new installs. Existing 6.1.8 users
+can fix the two bugs without needing to restart by running:  
+`./unrealircd hot-patch auto-vhost-618`
+
+For all the other fixes and new functionality, see the 6.1.8 release notes
+below.
+
+UnrealIRCd 6.1.8
+-----------------
+
+This release fixes a number of bugs. It also adds a new extban `~inherit` and
+auto-login support for vhosts.
+
+Do you like UnrealIRCd?
+Consider [making a donation](https://www.unrealircd.org/index/donations) or
+order something from the [shop](https://shop.unrealircd.org/).
+
+### Enhancements:
+* New [Extended ban](https://www.unrealircd.org/docs/Extended_bans#Group_4:_special)
+  to inherit channel bans from another channel:
+  * If in channel `#test` you add `+b ~inherit:#main` then anyone banned in
+    `#main` will be unable to join `#test`.
+  * This only applies for on-join ban checking, not for quiet bans,
+    nick-changes, text bans, etc.
+  * If the other channel (`#main` in this example) also has `~inherit` bans
+    then we do not follow these (no nesting).
+  * The maximum number of ~inherit bans in a channel is limited to only
+    1 by default, see
+    [set::max-inherit-extended-bans](https://www.unrealircd.org/docs/Set_block#set::max-inherit-extended-bans)
+  * This can also be used in `+I`, which entries are counted separately and
+    have their own limit.
+* [Vhosts](https://www.unrealircd.org/docs/Vhost_block):
+  We now support vhost::auto-login, which means you can set vhosts on users
+  automatically and we support variables in vhost::vhost (this works similar
+  to Gottem's autovhost module).
+  * An example would be:  
+    ```
+    /* Give users who identify to Services using SASL a nice vhost */
+    vhost {
+        auto-login yes;
+        vhost $account.users.example.net;
+        mask { identified yes; }
+    }
+    ```
+  * On-connect we will go through all vhost blocks that have auto-login
+    set to yes. Blocks are processed in the same order as they are in
+    the config (top-down). The first match wins.
+  * Note that you could already use Services to do this task.
+    This is just an extra feature so you can also do it in UnrealIRCd itself.
+  * The variables that are supported now use a generic framework called
+    [Standard variables](https://www.unrealircd.org/docs/Standard_variables)
+  * At the moment these can be used in vhost::vhost, oper::vhost,
+    blacklist::reason and set::oper-vhost
+* New option [set::oper-vhost](https://www.unrealircd.org/docs/Set_block#set::oper-vhost)
+  which sets a default oper::vhost. For example:
+  `set { oper-vhost $operclass.admin.example.net; }`
+  * If both set::oper-vhost and oper::vhost are present, the oper::vhost
+    takes precedence.
+* In the [ban ip { }](https://www.unrealircd.org/docs/Ban_IP_block)
+  and the [ban nick { }](https://www.unrealircd.org/docs/Ban_nick_block)
+  blocks you can now have multiple masks.
+* [JSON-RPC](https://www.unrealircd.org/docs/JSON-RPC):
+  * New call [`log.send`](https://www.unrealircd.org/docs/JSON-RPC:Log#log.send)
+    to send a log message / server notice.
+
+### Fixes:
+* In some circumstances users could hang during the handshake when
+  their DNS lookup result was cached and using c-ares 1.31.0 or later
+  (which was released on June 18 2024 and shipped with UnrealIRCd 6.1.7
+  to be used as a fallback for systems which don't have the c-ares
+  library installed).
+* Websockets of type 'text' had IRC messages from server to client cut off
+  too early when message tags were in use. Type 'binary' was unaffected.
+* The [require authentication { } block](https://www.unrealircd.org/docs/Require_authentication_block)
+  was broken in 6.1.7.*.
+* [JSON-RPC](https://www.unrealircd.org/docs/JSON-RPC) call `spamfilter.get`
+  could not retrieve information about config-based spamfilters.
+* The `decode_authenticate_plain()` was reading OOB. This function is not
+  used by UnrealIRCd itself but could affect third party modules.
+* Crash on invalid server-to-server command regarding `REHASH`
+  (This only affected trusted linked servers)
+
+### Changes:
+* [Security group blocks](https://www.unrealircd.org/docs/Security-group_block)
+  are now hidden in lists by default. If you want the security group to be shown
+  in things like `MODE #channel +b ~security-group:x` (which shows a list)
+  then you need to use `public yes;`. The default security groups
+  like known-users, webirc-users, etc. are public by default.
+* When retrieving cold or hot patches we now do proper GPG/PGP checks.
+  Just like we do on `./unrealircd upgrade`
+* Update shipped libraries: c-ares to 1.33.1
+* Move +/- 1000 lines of code from core to modules (regarding
+  throttling, maxperip, vhost, exit_client).
+
+### Developers and protocol:
+* The `MD` S2S command now supports `BIGLINES`, allowing synching of 16K
+  serialized moddata per entry. We don't plan to use this anytime soon,
+  this is mostly so all UnrealIRCd servers support this in a year or
+  two. However, if you do plan to serialize big moddata results in your
+  third party module then be sure all UnrealIRCd servers are on 6.1.8
+  or higher to prevent cut-off.
+
+UnrealIRCd 6.1.7.2
+-------------------
+UnrealIRCd 6.1.7.2 is a dot release:
+* [Central Blocklist](https://www.unrealircd.org/docs/Central_Blocklist):
+  Fix issue if CBL server is not reachable (caused nick collisions)
+* Stop offering curlinstall script. Most people don't need it anymore as
+  without curl we support https remote includes since UnrealIRCd 6.0.0,
+  which is usually sufficient. People who need other protocols can install
+  the curl library system-wide.
+
+UnrealIRCd 6.1.7.1 is a dot release:
+* Add country and ASN support in `WHOWAS`
+* Fix an annoying "[BUG] trying to modify fd -2 in fd table" message that
+  appeared to IRCOps sometimes. It was harmless and only happened if you
+  were using a recent version of the c-ares library (1.31.0 from June 18 2024
+  or later, which also is the one we ship with as fallback if the system
+  has no c-ares library installed).
+
+See the release notes for 6.1.7 below for a lot more features/changes.
+
+UnrealIRCd 6.1.7
+-----------------
+
+This is UnrealIRCd 6.1.7 stable. It comes with ASN support, more flexible
+ban user { } and require authentication { } blocks and more.
+
+UnrealIRCd recently turned 25 years! 🎉 See
+[UnrealIRCd celebrates its 25th birthday](https://forums.unrealircd.org/viewtopic.php?t=9363).
+
+### Enhancements:
+* In the [ban user { }](https://www.unrealircd.org/docs/Ban_user_block)
+  and [require authentication { }](https://www.unrealircd.org/docs/Require_authentication_block)
+  blocks the `mask` is now a
+  [Mask item](https://www.unrealircd.org/docs/Mask_item).
+  This means you can use all the power of mask items and security groups and
+  multiple matching criteria.
+* The GeoIP module now contains information about
+  [Autonomous System Numbers](https://www.unrealircd.org/docs/ASN):
+   * The asn is shown in the user connecting notice as `[asn: ###]`,
+     is shown in `WHOIS` (for IRCOps) and it is expanded in JSON data such as
+     [JSON Logging](https://www.unrealircd.org/docs/JSON_logging) and
+     [JSON-RPC](https://www.unrealircd.org/docs/JSON-RPC) calls like
+     `user.list`.
+  * Can be used in [Extended server ban](https://www.unrealircd.org/docs/Extended_server_bans):
+    `GLINE ~asn:64496 0 This ISP is banned`.
+  * Can be used in security groups and [mask items](https://www.unrealircd.org/docs/Mask_item)
+    so you can do like:
+    ```
+    require authentication {
+        mask { asn { 64496; 64497; 64498; } }
+        reason "Too much abuse from this ISP. You are required to log in with an account using SASL.";
+    }
+    ```
+   * In [Crule](https://www.unrealircd.org/docs/Crule) functions as `match_asn(64496)`
+   * Also available in regular extbans/invex, but normally users don't
+     know the IP or ASN of other users, unless you use no cloaking or
+     change [set::whois-details::asn](https://www.unrealircd.org/docs/Set_block#set::whois-details).
+* [JSON-RPC](https://www.unrealircd.org/docs/JSON-RPC):
+  Similar to oper and operclass, in an
+  [rpc-user](https://www.unrealircd.org/docs/Rpc-user_block) you now have
+  to specify an rpc-user::rpc-class. The rpc-class is defined in an
+  [rpc-class block](https://www.unrealircd.org/docs/Rpc-class_block)
+  and configures what JSON methods can be called.  
+  There are two default json-rpc classes:
+  * `full`: access to all JSON-RPC Methods
+  * `read-only`: access to things like *server_ban.list* but not to *server_ban.add*
+* [set::spamfilter::except](https://www.unrealircd.org/docs/Set_block#set::spamfilter::except)
+  is now a [Mask item](https://www.unrealircd.org/docs/Mask_item) instead of
+  only a list of exempted targets. A warning is created to existing users
+  along with a suggestion of how to use the new syntax. Technically, this is
+  not really new functionality as all this was already possible via
+  the [Except ban block](https://www.unrealircd.org/docs/Except_ban_block)
+  with type spamfilter, but it is more visible/logical to have this also.
+* New option [set::hide-killed-by](https://www.unrealircd.org/docs/Set_block#set::hide-killed-by):
+  We normally show the nickname of the oper who did the /KILL in the quit message.
+  When set to `yes` the quit message becomes shortened to "Killed (Reason)".
+  This can prevent oper harassment.
+* [set::restrict-commands](https://www.unrealircd.org/docs/Restrict_commands):
+  new option `channel-create` for managing who may create new channels.
+* New option [set::tls::certificate-expiry-notification](https://www.unrealircd.org/docs/Set_block#set::tls::certificate-expiry-notification):
+  since UnrealIRCd 5.0.8 we warn if a SSL/TLS certificate is (nearly) expired.
+  This new option allows turning it off, it is (still) on by default.
+* Add the ability to capture the same data as
+  [Central Spamreport](https://www.unrealircd.org/docs/Central_spamreport)
+  by providing an spamreport::url option.
+
+### Changes:
+* IRCOps with the operclass `locop` can now only `REHASH` the local server
+  and not remote servers.
+* Comment out some more in example.conf by default
+* Update shipped libraries: c-ares to 1.31.0, PCRE2 to 10.44,
+  Sodium to 1.0.20
+
+### Fixes:
+* Crash when removing the `websocket` option on a websocket listener.
+* Silence some compiler warnings regarding deprecation of c-ares API in
+  src/dns.c.
+* Memory leaks of around 1-2KB per rehash
+
+### Developers and protocol:
+* We use numeric 569 (RPL_WHOISASN) for displaying ASN info to IRCOps:  
+  `:irc.example.net 569 x whoiseduser 64496 :is connecting from AS64496 [Example Corp]`
+
+UnrealIRCd 6.1.6
+-----------------
+
+This is mostly a bug fix release but also comes with Crule enhancements.
+
+UnrealIRCd turned 25 a few weeks ago! 🎉 See
+[UnrealIRCd celebrates its 25th birthday](https://forums.unrealircd.org/viewtopic.php?t=9363).
+
+### Enhancements:
+* [Crule](https://www.unrealircd.org/docs/Crule) functions can now do everything
+  that [security group blocks](https://www.unrealircd.org/docs/Security-group_block)
+  can do.  
+  In practice, this means the following functions were added in this release:
+  * `is_tls()` returns true if the client is using SSL/TLS
+  * `in_security_group('known-users')` returns true if the user is in the
+    specified [security group](https://www.unrealircd.org/docs/Security-group_block).
+  * `match_mask('*@*.example.org')` or `match_mask('*.example.org')`
+    returns true if client matches mask.
+  * `match_ip('192.168.*')` or with CIDR like `match_ip('192.168.0.0/16')`
+    returns true if IP address of client matches.
+  * `is_identified()` which returns true if the client is identified to a services account.
+  * `is_webirc()` which returns true if the client is connected using WEBIRC.
+  * `is_websocket()` which returns true if the client is connected using WebSockets.
+  * `match_realname('*xyz*')` which returns true if the real name (gecos)
+     contains xyz.
+  * `match_account('xyz')` which returns true if the services account name is xyz.
+  * `match_country('NL')` which returns true if 
+    [GeoIP](https://www.unrealircd.org/docs/GeoIP) determined the
+    country to be NL.
+  * `match_certfp('abc')` which returns true if the 
+    [Certificate fingerprint](https://www.unrealircd.org/docs/Certificate_fingerprint)
+    is abc.
+
+### Changes:
+* For many years `REHASH -all` is the same as `REHASH` so we now reject
+  the former.
+* The [Crule](https://www.unrealircd.org/docs/Crule) function `inchannel('#xyz')`
+  is now called `in_channel('#xyz')` to match the naming style of the other
+  functions. The old name will keep working for the entire UnrealIRCd 6 series too.
+
+### Fixes:
+* Crash if you first REHASH and have a parse error (failed rehash 1) and then
+  REHASH again but have a "late" rehash error, such as a remote include
+  failing to load (failed rehash 2).
+* Crash on Windows when using
+  [Crule](https://www.unrealircd.org/docs/Crule) functions,
+  [Central Spamreport](https://www.unrealircd.org/docs/Central_spamreport) or
+  [Central Spamfilter](https://www.unrealircd.org/docs/Central_Spamfilter).
+* [Conditional config](https://www.unrealircd.org/docs/Defines_and_conditional_config):
+  using @if with a variable like `@if $VAR == "something"` always evaluated to false.
+* A [`~forward`](https://www.unrealircd.org/docs/Extended_bans#Group_2:_actions)
+  ban did not check ban exemptions (+e), always forwarding the user.
+* When booting for the first time (without any cached files) the IRCd
+  downloads GeoIP.dat. If that fails, e.g. due to lack of internet connectivity,
+  we now show a warning and continue booting instead of it being a hard error.
+  Note that we already dealt with this properly after the file has been cached
+  (so after first download), see "What if your web server is down" in
+  [Remote includes](https://www.unrealircd.org/docs/Remote_includes#What_if_your_web_server_is_down).
+
+### Removed:
+* The `tls-and-known-users` [security group](https://www.unrealircd.org/docs/Security-group_block)
+  was confusing, in the sense that this group consisted of tls-users
+  and of known-users (in an OR fashion, not AND).
+  Since this group is rarely used it has now been removed altogether.
+  If you used it in your configuration then you can still manually
+  (re)create the security group with:
+  ```
+  security-group tls-and-known-users { identified yes; reputation-score 25; tls yes; }
+  ```
+
+### Developers and protocol:
+* Modules can now provide SASL locally, see
+  [Dev:Authentication module](https://www.unrealircd.org/docs/Dev:Authentication_module).
+
+UnrealIRCd 6.1.5
+-----------------
+
+This is just a regular release with various enhancements and bug fixes.
+
+### Enhancements:
+* You can now use 
+  [oper::auto-join](https://www.unrealircd.org/docs/Oper_block#auto-join)
+  in an oper block to override the generic
+  [set::oper-auto-join](https://www.unrealircd.org/docs/Set_block#set::oper-auto-join)
+  setting.
+* The `operclass` property is now available in the
+  [security-group block](https://www.unrealircd.org/docs/Security-group_block)
+  and mask items.  
+  Eg: `security-group netadmin { operclass { netadmin; netadmin-with-override; } }`
+* Support for IRCv3
+  [`draft/no-implicit-names`](https://ircv3.net/specs/extensions/no-implicit-names)
+* Improved performance by skipping useless `TAGMSG` spamfilter checks
+  (e.g. for typing notifications).
+* Improved performance if you have hundreds of non-regex spamfilters.
+* Add more [Crule](https://www.unrealircd.org/docs/Crule) functions:
+  * `is_away()` returns true if the client is currently away
+  * `has_user_mode('x')` returns true if all the user modes are set on the
+    client.
+  * `has_channel_mode('x')` can be used for spamfilters with a destination
+    channel, such as messages: it returns true if all specified channel modes
+    are set on the channel.
+* Add `example.pt.conf` - (Brazilian) Portuguese example configuration file.
+
+### Changes:
+* The config parser now logs a warning if you have a `/*` within a `/*`
+
+### Fixes:
+* The whowasdb module caused `WHOWAS` entries to vanish (way too soon)
+* If your shell account only allowed very few file descriptors (eg: `ulimit -n`
+  returned `150`), then UnrealIRCd would fail to boot. This, because due to
+  reserved file descriptors you would have 0 left, or even a negative number.
+* Crash when running `SPAMFILTER` as an IRCOp when using UTF8 spamfilters.
+* [Set blocks for a security group](https://www.unrealircd.org/docs/Set_block#Set_block_for_a_security_group)
+  allow you to set a custom 
+  [set::modes-on-connect](https://www.unrealircd.org/docs/Set_block#set::modes-on-connect)
+  for a security group. However this setting happened too early, so security
+  groups matching account names or 'identified' (when using
+  [SASL](https://www.unrealircd.org/docs/SASL)) were not working.
+* `+I ~operclass` was not working properly.
+* Removed confusing "Central blocklist too slow to respond" message when using
+  [soft bans](https://www.unrealircd.org/docs/Soft_ban) or a
+  [require authentication block](https://www.unrealircd.org/docs/Require_authentication_block).
 
 UnrealIRCd 6.1.4
 -----------------
