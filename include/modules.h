@@ -582,11 +582,9 @@ struct HistoryFilter {
 typedef struct HistoryLogLine HistoryLogLine;
 struct HistoryLogLine {
 	HistoryLogLine *prev, *next;
-	time_t t;		/**< Rounded time on seconds, for quick access. */
-	char *msgid;		/**< Pointer to 'msgid' mtag. Do NOT free this, it is freed by freeing 'mtags'. */
-	char *time;		/**< Pointer to 'time' mtag. Do NOT free this, it is freed by freeing 'mtags'. */
-	MessageTag *mtags;	/**< Message tags associated with this message */
-	char line[1];		/**< The full (old-skool) IRC protocol line */
+	time_t t;
+	MessageTag *mtags;
+	char line[1];
 };
 
 typedef struct HistoryResult HistoryResult;
@@ -1522,7 +1520,7 @@ int hooktype_local_kick(Client *client, Client *victim, Channel *channel, Messag
 int hooktype_remote_kick(Client *client, Client *victim, Channel *channel, MessageTag *mtags, const char *comment);
 
 /** Called right before a message is sent to the channel (function prototype for HOOKTYPE_PRE_CHANMSG).
- * This function is only used by delayjoin. It cannot block a message. See hooktype_can_send_to_user() instead!
+ * This function is only used by delayjoin. It cannot block a message. See hooktype_can_send_to_channel() instead!
  * @param client		The client
  * @param channel		The channel
  * @param mtags         	Message tags associated with the event (pointer-to-pointer)
