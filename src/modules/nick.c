@@ -806,8 +806,11 @@ void welcome_user(Client *client, TKL *viruschan_tkl)
 	sendnumeric(client, RPL_MYINFO, me.name, version, umodestring, cmodestring);
 
 	RunHook(HOOKTYPE_WELCOME, client, 4);
-	for (i = 0; ISupportStrings[i]; i++)
-		sendnumeric(client, RPL_ISUPPORT, ISupportStrings[i]);
+
+	/* If user has draft/extended-isupport, assume they already got ISUPPORT tokens */
+	if (!HasCapability(client, "draft/extended-isupport"))
+		for (i = 0; ISupportStrings[i]; i++)
+			sendnumeric(client, RPL_ISUPPORT, ISupportStrings[i]);
 
 	RunHook(HOOKTYPE_WELCOME, client, 5);
 
