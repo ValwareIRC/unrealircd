@@ -20,6 +20,7 @@ void rpc_channel_get(Client *client, json_t *request, json_t *params);
 void rpc_channel_set_mode(Client *client, json_t *request, json_t *params);
 void rpc_channel_set_topic(Client *client, json_t *request, json_t *params);
 void rpc_channel_kick(Client *client, json_t *request, json_t *params);
+void rpc_channel_create(Client *client, json_t *request, json_t *params);
 
 MOD_INIT()
 {
@@ -64,6 +65,14 @@ MOD_INIT()
 	memset(&r, 0, sizeof(r));
 	r.method = "channel.kick";
 	r.call = rpc_channel_kick;
+	if (!RPCHandlerAdd(modinfo->handle, &r))
+	{
+		config_error("[rpc/channel] Could not register RPC handler");
+		return MOD_FAILED;
+	}
+	memset(&r, 0, sizeof(r));
+	r.method = "channel.create";
+	r.call = rpc_channel_create;
 	if (!RPCHandlerAdd(modinfo->handle, &r))
 	{
 		config_error("[rpc/channel] Could not register RPC handler");
@@ -231,6 +240,70 @@ void rpc_channel_kick(Client *client, json_t *request, json_t *params)
 	 * that is, assuming single channel ;)
 	 */
 	result = json_boolean(1);
+	rpc_response(client, request, result);
+	json_decref(result);
+}
+
+void rpc_channel_create(Client *client, json_t *request, json_t *params)
+{
+	json_t *result;
+	const char *channelname;
+	const char *modes = NULL, *parameters = NULL;
+	const char *topic = NULL, *set_by = NULL, *set_at_str = NULL;
+	Channel *channel;
+	MessageTag *mtags = NULL;
+	time_t set_at = 0;
+
+	REQUIRE_PARAM_STRING("channel", channelname);
+	OPTIONAL_PARAM_STRING("modes", modes);
+	OPTIONAL_PARAM_STRING("parameters", parameters);
+	OPTIONAL_PARAM_STRING("topic", topic);
+	OPTIONAL_PARAM_STRING("set_by", set_by);
+	OPTIONAL_PARAM_STRING("set_at", set_at_str);
+	if (set_at_str)
+		set_at = server_time_to_unix_time(set_at_str);
+
+	/* Validate channel name */
+	if (!valid_channelname(channelname))
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INVALID_NAME, "Invalid channel name");
+		return;
+	}
+
+	/* Channel must not already exist */
+	if (find_channel(channelname))
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_ALREADY_EXISTS, "Channel already exists");
+		return;
+	}
+
+	/* Create the channel */
+	channel = make_channel(channelname);
+	if (!channel)
+	{
+		rpc_error(client, request, JSON_RPC_ERROR_INTERNAL_ERROR, "Could not create channel");
+		return;
+	}
+
+	/* Optional: set channel modes */
+	if (modes)
+	{
+		mtag_add_issued_by(&mtags, client, NULL);
+		set_channel_mode(channel, mtags, modes, parameters ? parameters : "");
+		safe_free_message_tags(mtags);
+	}
+
+	/* Optional: set topic */
+	if (topic)
+	{
+		mtag_add_issued_by(&mtags, client, NULL);
+		set_channel_topic(&me, channel, mtags, topic, set_by, set_at);
+		safe_free_message_tags(mtags);
+	}
+
+	/* Return the newly created channel object */
+	result = json_object();
+	json_expand_channel(result, "channel", channel, 3);
 	rpc_response(client, request, result);
 	json_decref(result);
 }
